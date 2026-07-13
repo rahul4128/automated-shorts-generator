@@ -1,0 +1,10 @@
+{
+  "name": "automated-shorts-renderer",
+  "version": "1.0.0",
+  "dependencies": {
+    "remotion": "^4.0.0",
+    "@remotion/cli": "^4.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  }
+}
