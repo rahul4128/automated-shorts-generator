@@ -1,0 +1,26 @@
+name: Render Automated Video
+on:
+  repository_dispatch:
+    types: [trigger-render]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install FFmpeg & System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgbm-dev libnss3 libatk-bridge2.0-0 libgtk-3-0
+
+      - name: Debug Payload
+        run: |
+          echo "Audio URL: ${{ github.event.client_payload.audioUrl }}"
+          echo "Script text: ${{ github.event.client_payload.text }}"
