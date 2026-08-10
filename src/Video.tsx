@@ -1,5 +1,5 @@
 import React from "react";
-import { AbsoluteFill, Audio, Img, useCurrentFrame, interpolate } from "remotion";
+import { AbsoluteFill, Audio, Img, useCurrentFrame, interpolate, Easing } from "remotion";
 
 interface Props {
   audioUrl: string;
@@ -9,7 +9,11 @@ interface Props {
 
 export const ShortVideo: React.FC<Props> = ({ audioUrl, imageUrl, captionText }) => {
   const frame = useCurrentFrame();
-  const zoom = interpolate(frame, [0, 450], [1, 1.15], { extrapolateRight: "clamp" });
+  // Gentle, eased zoom - barely noticeable, no jarring motion
+  const zoom = interpolate(frame, [0, 450], [1, 1.06], {
+    extrapolateRight: "clamp",
+    easing: Easing.bezier(0.25, 0.1, 0.25, 1),
+  });
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
