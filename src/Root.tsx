@@ -4,7 +4,9 @@ import { getAudioDurationInSeconds } from "@remotion/media-utils";
 import { ShortVideo } from "./Video";
 
 const FPS = 30;
-const FALLBACK_SECONDS = 15;
+// Generous safety-net fallback: only used if duration detection genuinely fails.
+// Set high on purpose so a detection failure never truncates real audio.
+const FALLBACK_SECONDS = 60;
 
 export const RemotionRoot: React.FC = () => {
   const inputProps = getInputProps();
@@ -26,10 +28,13 @@ export const RemotionRoot: React.FC = () => {
         let seconds = FALLBACK_SECONDS;
         if (audioUrl) {
           try {
-            seconds = await getAudioDurationInSeconds(audioUrl);
-            // Add half a second of tail padding so audio never feels cut off.
-            seconds = seconds + 0.5;
+            const detected = await getAudioDurationInSeconds(audioUrl);
+            if (detected && detected > 0) {
+              // Add half a second of tail padding so audio never feels cut off.
+              seconds = detected + 0.5;
+            }
           } catch (e) {
+            // Detection failed - keep the generous fallback rather than a short one.
             seconds = FALLBACK_SECONDS;
           }
         }
