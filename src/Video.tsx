@@ -1,5 +1,5 @@
 import React from "react";
-import { AbsoluteFill, Audio, Img, useCurrentFrame, interpolate, Easing } from "remotion";
+import { AbsoluteFill, Audio, Img, useCurrentFrame, useVideoConfig, interpolate, Easing } from "remotion";
 
 interface Props {
   audioUrl: string;
@@ -9,15 +9,21 @@ interface Props {
 
 export const ShortVideo: React.FC<Props> = ({ audioUrl, imageUrl, captionText }) => {
   const frame = useCurrentFrame();
-  // Gentle, eased zoom - barely noticeable, no jarring motion
-  const zoom = interpolate(frame, [0, 450], [1, 1.06], {
+  const { durationInFrames } = useVideoConfig();
+
+  // Visible but smooth Ken Burns effect: zoom + gentle pan across the full clip.
+  const zoom = interpolate(frame, [0, durationInFrames], [1, 1.18], {
+    extrapolateRight: "clamp",
+    easing: Easing.bezier(0.25, 0.1, 0.25, 1),
+  });
+  const panX = interpolate(frame, [0, durationInFrames], [0, -3], {
     extrapolateRight: "clamp",
     easing: Easing.bezier(0.25, 0.1, 0.25, 1),
   });
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
+      <AbsoluteFill style={{ transform: `scale(${zoom}) translateX(${panX}%)` }}>
         <Img src={imageUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
       </AbsoluteFill>
       <AbsoluteFill
