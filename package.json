@@ -1,10 +1,19 @@
 {
-  "name": "automated-shorts-renderer",
+  "name": "automated-shorts-generator",
   "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "render": "remotion render src/index.ts ShortVideo out/video.mp4"
+  },
   "dependencies": {
-    "remotion": "^4.0.0",
-    "@remotion/cli": "^4.0.0",
-    "react": "^18.0.0",
-    "react-dom": "^18.0.0"
+    "@remotion/cli": "4.0.190",
+    "@remotion/renderer": "4.0.190",
+    "remotion": "4.0.190",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.1",
+    "typescript": "5.5.4"
   }
 }
