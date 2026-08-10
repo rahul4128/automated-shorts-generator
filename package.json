@@ -6,9 +6,9 @@
     "render": "remotion render src/index.ts ShortVideo out/video.mp4"
   },
   "dependencies": {
-    "@remotion/cli": "4.0.190",
-    "@remotion/renderer": "4.0.190",
-    "remotion": "4.0.190",
+    "@remotion/cli": "4.0.507",
+    "@remotion/renderer": "4.0.507",
+    "remotion": "4.0.507",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },
