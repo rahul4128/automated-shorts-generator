@@ -1,0 +1,35 @@
+name: Render Automated Video
+
+on:
+  repository_dispatch:
+    types: [trigger-render]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Render video
+        run: |
+          npx remotion render src/index.ts ShortVideo out/video.mp4 \
+            --props="{\"audioUrl\":\"${{ github.event.client_payload.audioUrl }}\",\"imageUrl\":\"${{ github.event.client_payload.imageUrl }}\",\"captionText\":\"${{ github.event.client_payload.captionText }}\"}"
+
+      - name: Upload video as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-video
+          path: out/video.mp4
+
+      - name: Create release with video
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: video-${{ github.run_id }}
+          files: out/video.mp4
