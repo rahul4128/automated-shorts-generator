@@ -4,6 +4,9 @@ on:
   repository_dispatch:
     types: [trigger-render]
 
+permissions:
+  contents: write
+
 jobs:
   render:
     runs-on: ubuntu-latest
