@@ -24,7 +24,7 @@ const IMAGE_POOL = [
   "https://commons.wikimedia.org/wiki/Special:FilePath/Hanuman%20painting%20c1920.jpg",
   "https://commons.wikimedia.org/wiki/Special:FilePath/Hanuman%20painting%20c1920%202.jpg",
 ];
-const NUM_IMAGES = 3;
+const NUM_IMAGES = 6;
 
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
