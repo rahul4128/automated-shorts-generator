@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { AbsoluteFill, Audio, Img, useCurrentFrame, useVideoConfig, interpolate } from "remotion";
+import { AbsoluteFill, Audio, Img, useCurrentFrame, useVideoConfig } from "remotion";
 
 interface Props {
   audioUrl: string;
@@ -41,36 +41,15 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   const [images] = useState(() => shuffle(IMAGE_POOL).slice(0, NUM_IMAGES));
 
   const segmentLen = durationInFrames / images.length;
-  // Smooth dissolve between images. Scales with segment length so it always
-  // feels gradual - capped between 20 and 40 frames (about 0.7-1.3s at 30fps).
-  const fadeFrames = Math.max(20, Math.min(40, Math.round(segmentLen * 0.25)));
+
+  // Simple: show exactly one image at a time, full frame, no zoom, no fade.
+  // A clean hard cut to the next image when its segment starts.
+  const currentIndex = Math.min(Math.floor(frame / segmentLen), images.length - 1);
+  const src = images[currentIndex];
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {images.map((src, i) => {
-        const segStart = i * segmentLen;
-        const localFrame = frame - segStart;
-        if (localFrame < -fadeFrames || localFrame > segmentLen + fadeFrames) return null;
-
-        const opacity = interpolate(
-          localFrame,
-          [0, fadeFrames, segmentLen - fadeFrames, segmentLen],
-          [0, 1, 1, 0],
-          { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
-        );
-        const zoom = interpolate(localFrame, [0, segmentLen], [1, 1.12], {
-          extrapolateLeft: "clamp",
-          extrapolateRight: "clamp",
-        });
-
-        return (
-          <AbsoluteFill key={src} style={{ opacity }}>
-            <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
-              <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            </AbsoluteFill>
-          </AbsoluteFill>
-        );
-      })}
+      <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
       {audioUrl ? <Audio src={audioUrl} /> : null}
     </AbsoluteFill>
   );
