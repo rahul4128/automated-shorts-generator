@@ -1,5 +1,5 @@
 import React from "react";
-import { Composition, getInputProps, staticFile } from "remotion";
+import { Composition, staticFile } from "remotion";
 import { getAudioDurationInSeconds } from "@remotion/media-utils";
 import { ShortVideo } from "./Video";
 
@@ -7,7 +7,6 @@ const FPS = 30;
 const FALLBACK_SECONDS = 60;
 
 export const RemotionRoot: React.FC = () => {
-  const inputProps = getInputProps();
   const audioFile = staticFile("audio.wav");
   return (
     <Composition
@@ -19,8 +18,6 @@ export const RemotionRoot: React.FC = () => {
       height={1920}
       defaultProps={{
         audioUrl: audioFile,
-        imageUrl: (inputProps as any).imageUrl || "",
-        captionText: (inputProps as any).captionText || "",
       }}
       calculateMetadata={async () => {
         let seconds = FALLBACK_SECONDS;
