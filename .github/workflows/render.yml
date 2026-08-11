@@ -17,13 +17,31 @@ jobs:
         with:
           node-version: 20
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install dependencies
         run: npm install
+
+      - name: Install Piper TTS (open source, offline, no API/quota)
+        run: pip install piper-tts
+
+      - name: Download Hindi voice model
+        run: |
+          mkdir -p models
+          curl -L -o models/hi_IN-rohan-medium.onnx "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx"
+          curl -L -o models/hi_IN-rohan-medium.onnx.json "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json"
+
+      - name: Synthesize Hindi audio with Piper
+        run: |
+          mkdir -p public
+          echo "${{ github.event.client_payload.scriptText }}" | piper --model models/hi_IN-rohan-medium.onnx --output_file public/audio.wav
 
       - name: Render video
         run: |
           npx remotion render src/index.ts ShortVideo out/video.mp4 \
-            --props="{\"audioUrl\":\"${{ github.event.client_payload.audioUrl }}\",\"imageUrl\":\"${{ github.event.client_payload.imageUrl }}\",\"captionText\":\"${{ github.event.client_payload.captionText }}\"}"
+            --props="{\"imageUrl\":\"${{ github.event.client_payload.imageUrl }}\",\"captionText\":\"${{ github.event.client_payload.captionText }}\"}"
 
       - name: Upload video as artifact
         uses: actions/upload-artifact@v4
