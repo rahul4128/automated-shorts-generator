@@ -58,18 +58,17 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   const [handle] = useState(() => delayRender("Fetching fresh devotional artwork from Wikimedia"));
 
   useEffect(() => {
-    (async () => {
+     (async () => {
       try {
         const picks = shuffle(CATEGORIES).slice(0, 4);
         const results = await Promise.all(picks.map((c) => fetchCategoryImages(c)));
-        // De-duplicate - the same file can be tagged under multiple categories.
         const unique = Array.from(new Set(results.flat()));
         let titles = shuffle(unique).slice(0, NUM_IMAGES);
         if (titles.length === 0) {
           setImages([FALLBACK_IMAGE]);
         } else {
           const urls = titles.map(
-            (t) => `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(t.replace(/^File:/, ""))}`
+            (t) => `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(t.replace(/^File:, ""))}`
           );
           setImages(urls);
         }
@@ -84,36 +83,22 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   if (!images) return null;
 
   const segmentLen = durationInFrames / images.length;
-  // Fade duration scales with segment length so short clips never feel like a flicker
-  // and long clips never feel like a jump cut. Capped between 15 and 30 frames.
-  const fadeFrames = Math.max(15, Math.min(30, Math.round(segmentLen * 0.2)));
+
+  // Hard cut between images - no crossfade/overlap. Only the image whose
+  // segment we're currently in gets rendered at all.
+  const currentIndex = Math.min(Math.floor(frame / segmentLen), images.length - 1);
+  const src = images[currentIndex];
+  const localFrame = frame - currentIndex * segmentLen;
+  const zoom = interpolate(localFrame, [0, segmentLen], [1, 1.12], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {images.map((src, i) => {
-        const segStart = i * segmentLen;
-        const localFrame = frame - segStart;
-        if (localFrame < -fadeFrames || localFrame > segmentLen + fadeFrames) return null;
-
-        const opacity = interpolate(
-          localFrame,
-          [0, fadeFrames, segmentLen - fadeFrames, segmentLen],
-          [0, 1, 1, 0],
-          { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
-        );
-        const zoom = interpolate(localFrame, [0, segmentLen], [1, 1.12], {
-          extrapolateLeft: "clamp",
-          extrapolateRight: "clamp",
-        });
-
-        return (
-          <AbsoluteFill key={src} style={{ opacity }}>
-            <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
-              <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            </AbsoluteFill>
-          </AbsoluteFill>
-        );
-      })}
+      <AbsoluteFill key={src} style={{ transform: `scale(${zoom})` }}>
+        <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+      </AbsoluteFill>
       {audioUrl ? <Audio src={audioUrl} /> : null}
     </AbsoluteFill>
   );
