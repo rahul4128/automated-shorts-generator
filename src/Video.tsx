@@ -49,7 +49,7 @@ function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-const NUM_IMAGES = 5;
+const NUM_IMAGES = 3;
 
 export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   const frame = useCurrentFrame();
@@ -82,7 +82,7 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   if (!images) return null;
 
   const segmentLen = durationInFrames / images.length;
-  const fadeFrames = 10;
+  const fadeFrames = 20;
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
