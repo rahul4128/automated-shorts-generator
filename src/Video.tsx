@@ -1,5 +1,5 @@
 import React from "react";
-import { AbsoluteFill, Audio, useCurrentFrame, useVideoConfig, interpolate, spring, Easing } from "remotion";
+import { AbsoluteFill, Audio, useCurrentFrame, useVideoConfig, interpolate, spring } from "remotion";
 
 interface Props {
   audioUrl: string;
@@ -11,33 +11,36 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl, captionText }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
 
-  // Gentle bounce - continuous up/down loop
-  const bounceCycle = 20; // frames per bounce
+  // Body bounce (bigger, more physical than before)
+  const bounceCycle = 24;
   const bouncePhase = (frame % bounceCycle) / bounceCycle;
-  const bounceY = Math.sin(bouncePhase * Math.PI * 2) * 18;
+  const bounceY = Math.sin(bouncePhase * Math.PI * 2) * 14;
+  const squash = 1 + Math.sin(bouncePhase * Math.PI * 2) * 0.03;
 
-  // Blink periodically (quick close every ~2.5s)
-  const blinkCycle = 75;
+  // Arm wave while talking
+  const armCycle = 30;
+  const armPhase = (frame % armCycle) / armCycle;
+  const armAngle = audioUrl ? Math.sin(armPhase * Math.PI * 2) * 22 : 4;
+
+  // Blink
+  const blinkCycle = 80;
   const blinkPhase = frame % blinkCycle;
   const isBlinking = blinkPhase < 4;
-  const eyeHeight = isBlinking ? 4 : 34;
+  const eyeHeight = isBlinking ? 4 : 30;
 
-  // Mouth "talking" wobble - open/close rhythmically while audio plays
+  // Talking mouth
   const mouthCycle = 8;
   const mouthPhase = (frame % mouthCycle) / mouthCycle;
-  const mouthOpen = audioUrl ? Math.abs(Math.sin(mouthPhase * Math.PI * 2)) : 0.15;
-  const mouthHeight = 20 + mouthOpen * 45;
+  const mouthOpen = audioUrl ? Math.abs(Math.sin(mouthPhase * Math.PI * 2)) : 0.1;
+  const mouthHeight = 14 + mouthOpen * 32;
 
-  // Gentle intro pop-in
-  const introScale = spring({ frame, fps, config: { damping: 12, mass: 0.6 } });
-
-  // Background color cycles slowly through friendly warm tones
-  const hue = interpolate(frame, [0, durationInFrames], [30, 330], { extrapolateRight: "clamp" });
+  const introScale = spring({ frame, fps, config: { damping: 12, mass: 0.7 } });
+  const hue = interpolate(frame, [0, durationInFrames], [24, 46], { extrapolateRight: "clamp" });
 
   return (
     <AbsoluteFill
       style={{
-        background: `linear-gradient(160deg, hsl(${hue}, 85%, 68%), hsl(${(hue + 40) % 360}, 80%, 78%))`,
+        background: `linear-gradient(160deg, hsl(${hue}, 70%, 82%), hsl(${hue + 20}, 75%, 70%))`,
         justifyContent: "center",
         alignItems: "center",
       }}
@@ -45,35 +48,108 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl, captionText }) => {
       <div
         style={{
           transform: `translateY(${bounceY}px) scale(${introScale})`,
-          width: 460,
-          height: 460,
-          borderRadius: "50%",
-          background: "#FFD54A",
-          boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
           position: "relative",
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "center",
+          width: 520,
+          height: 620,
         }}
       >
+        {/* Left arm */}
+        <div
+          style={{
+            position: "absolute",
+            top: 300,
+            left: 60,
+            width: 100,
+            height: 34,
+            borderRadius: 20,
+            background: "#8B5E3C",
+            transformOrigin: "right center",
+            transform: `rotate(${-30 - armAngle}deg)`,
+          }}
+        />
+        {/* Right arm */}
+        <div
+          style={{
+            position: "absolute",
+            top: 300,
+            right: 60,
+            width: 100,
+            height: 34,
+            borderRadius: 20,
+            background: "#8B5E3C",
+            transformOrigin: "left center",
+            transform: `rotate(${30 + armAngle}deg)`,
+          }}
+        />
+
+        {/* Body */}
+        <div
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: "50%",
+            transform: `translateX(-50%) scaleY(${squash})`,
+            width: 300,
+            height: 260,
+            borderRadius: "48% 48% 44% 44%",
+            background: "#A9714A",
+            boxShadow: "0 18px 40px rgba(0,0,0,0.2)",
+          }}
+        />
+
+        {/* Ears */}
+        <div style={{ position: "absolute", top: 10, left: 70, width: 90, height: 90, borderRadius: "50%", background: "#8B5E3C" }} />
+        <div style={{ position: "absolute", top: 10, right: 70, width: 90, height: 90, borderRadius: "50%", background: "#8B5E3C" }} />
+        <div style={{ position: "absolute", top: 30, left: 90, width: 50, height: 50, borderRadius: "50%", background: "#F0C9A0" }} />
+        <div style={{ position: "absolute", top: 30, right: 90, width: 50, height: 50, borderRadius: "50%", background: "#F0C9A0" }} />
+
+        {/* Head */}
+        <div
+          style={{
+            position: "absolute",
+            top: 40,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: 340,
+            height: 320,
+            borderRadius: "50%",
+            background: "#C48A5C",
+            boxShadow: "0 14px 30px rgba(0,0,0,0.18)",
+          }}
+        />
+
+        {/* Muzzle */}
+        <div
+          style={{
+            position: "absolute",
+            top: 200,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: 190,
+            height: 150,
+            borderRadius: "50%",
+            background: "#F0C9A0",
+         }}
+        />
+
         {/* Eyes */}
-        <div style={{ position: "absolute", top: 150, left: 110, width: 46, height: eyeHeight, borderRadius: 30, background: "#3A2E1F", transition: "none" }} />
-        <div style={{ position: "absolute", top: 150, left: 300, width: 46, height: eyeHeight, borderRadius: 30, background: "#3A2E1F" }} />
-        {/* Cheeks */}
-        <div style={{ position: "absolute", top: 240, left: 70, width: 55, height: 32, borderRadius: "50%", background: "#FF8A80", opacity: 0.6 }} />
-        <div style={{ position: "absolute", top: 240, left: 335, width: 55, height: 32, borderRadius: "50%", background: "#FF8A80", opacity: 0.6 }} />
+        <div style={{ position: "absolute", top: 150, left: 150, width: 32, height: eyeHeight, borderRadius: 20, background: "#2E2116" }} />
+        <div style={{ position: "absolute", top: 150, right: 150, width: 32, height: eyeHeight, borderRadius: 20, background: "#2E2116" }} />
+
+        {/* Nose */}
+        <div style={{ position: "absolute", top: 218, left: "50%", transform: "translateX(-50%)", width: 46, height: 32, borderRadius: "50%", background: "#2E2116" }} />
+
         {/* Mouth */}
         <div
           style={{
             position: "absolute",
-            top: 275,
-            left: 180,
-            width: 100,
+            top: 255,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: 70,
             height: mouthHeight,
-            borderRadius: "0 0 50px 50px",
-            background: "#B23B3B",
-            border: "6px solid #3A2E1F",
-            borderTop: "none",
+            borderRadius: "0 0 35px 35px",
+            background: "#7A3B2E",
           }}
         />
       </div>
@@ -81,12 +157,12 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl, captionText }) => {
       <div
         style={{
           position: "absolute",
-          bottom: 130,
+          bottom: 110,
           left: 60,
           right: 60,
           textAlign: "center",
           color: "white",
-          fontSize: 60,
+          fontSize: 58,
           fontFamily: "Arial, sans-serif",
           fontWeight: 800,
           textShadow: "0 4px 12px rgba(0,0,0,0.5)",
