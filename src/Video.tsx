@@ -60,9 +60,11 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   useEffect(() => {
     (async () => {
       try {
-        const picks = shuffle(CATEGORIES).slice(0, 3);
+        const picks = shuffle(CATEGORIES).slice(0, 4);
         const results = await Promise.all(picks.map((c) => fetchCategoryImages(c)));
-        let titles = shuffle(results.flat()).slice(0, NUM_IMAGES);
+        // De-duplicate - the same file can be tagged under multiple categories.
+        const unique = Array.from(new Set(results.flat()));
+        let titles = shuffle(unique).slice(0, NUM_IMAGES);
         if (titles.length === 0) {
           setImages([FALLBACK_IMAGE]);
         } else {
@@ -82,7 +84,9 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   if (!images) return null;
 
   const segmentLen = durationInFrames / images.length;
-  const fadeFrames = 20;
+  // Fade duration scales with segment length so short clips never feel like a flicker
+  // and long clips never feel like a jump cut. Capped between 15 and 30 frames.
+  const fadeFrames = Math.max(15, Math.min(30, Math.round(segmentLen * 0.2)));
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
@@ -97,13 +101,13 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
           [0, 1, 1, 0],
           { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
         );
-        const zoom = interpolate(localFrame, [0, segmentLen], [1, 1.1], {
+        const zoom = interpolate(localFrame, [0, segmentLen], [1, 1.12], {
           extrapolateLeft: "clamp",
           extrapolateRight: "clamp",
         });
 
         return (
-          <AbsoluteFill key={i} style={{ opacity }}>
+          <AbsoluteFill key={src} style={{ opacity }}>
             <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
               <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
             </AbsoluteFill>
