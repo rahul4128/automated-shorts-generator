@@ -1,31 +1,92 @@
-import React from "react";
-import { AbsoluteFill, Audio, Img, useCurrentFrame, useVideoConfig, interpolate } from "remotion";
+import React, { useEffect, useState } from "react";
+import {
+  AbsoluteFill,
+  Audio,
+  Img,
+  useCurrentFrame,
+  useVideoConfig,
+  interpolate,
+  delayRender,
+  continueRender,
+} from "remotion";
 
 interface Props {
   audioUrl: string;
 }
 
-// Curated real, verified public-domain artwork - cycles through all of these within one video.
-// (Ganesh entry removed - that exact Wikimedia filename failed to resolve.)
-const IMAGES = [
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Fresco%20depicting%20a%20scene%20from%20the%20Indic%20epic%2C%20the%20Mahabharata%2C%20with%20Krishna%20and%20Arjuna%2C%20from%20Mansar%20Haveli.jpg",
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Rama%20breaking%20the%20bow%20of%20lord%20Shiva%20in%20the%20court%20of%20Raja%20Janaka.jpg",
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Brooklyn%20Museum%20-%20Krishna%20Counsels%20the%20Pandava%20Leaders%20Page%20from%20a%20Mahabharata%20series.jpg",
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Ascent%20of%20Rama%2C%20From%20the%20Mewar%20Ramayana.jpg",
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Shiva%27s%20Twilight%20Dance%20LACMA%20M.77.154.31.jpg",
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Illustration%20of%20the%20Mahabharata.jpg",
+const CATEGORIES = [
+  "Krishna",
+  "Rama",
+  "Mahabharata",
+  "Ramayana",
+  "Shiva",
+  "Ganesha",
+  "Vishnu",
+  "Hanuman",
 ];
+
+const FALLBACK_IMAGE =
+  "https://commons.wikimedia.org/wiki/Special:FilePath/Fresco%20depicting%20a%20scene%20from%20the%20Indic%20epic%2C%20the%20Mahabharata%2C%20with%20Krishna%20and%20Arjuna%2C%20from%20Mansar%20Haveli.jpg";
+
+async function fetchCategoryImages(category: string, limit = 20): Promise<string[]> {
+  const url = `https://commons.wikimedia.org/w/api.php?action=query&list=categorymembers&cmtitle=Category:${encodeURIComponent(
+    category
+  )}&cmtype=file&cmlimit=${limit}&format=json&origin=*`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const members = data?.query?.categorymembers || [];
+  return members
+    .map((m: any) => m.title as string)
+    .filter((t: string) => /\.(jpg|jpeg|png)$/i.test(t));
+}
+
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+const NUM_IMAGES = 5;
 
 export const ShortVideo: React.FC<Props> = ({ audioUrl }) => {
   const frame = useCurrentFrame();
   const { durationInFrames } = useVideoConfig();
+  const [images, setImages] = useState<string[] | null>(null);
+  const [handle] = useState(() => delayRender("Fetching fresh devotional artwork from Wikimedia"));
 
-  const segmentLen = durationInFrames / IMAGES.length;
+  useEffect(() => {
+    (async () => {
+      try {
+        const picks = shuffle(CATEGORIES).slice(0, 3);
+        const results = await Promise.all(picks.map((c) => fetchCategoryImages(c)));
+        let titles = shuffle(results.flat()).slice(0, NUM_IMAGES);
+        if (titles.length === 0) {
+          setImages([FALLBACK_IMAGE]);
+        } else {
+          const urls = titles.map(
+            (t) => `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(t.replace(/^File:/, ""))}`
+          );
+          setImages(urls);
+        }
+      } catch (e) {
+        setImages([FALLBACK_IMAGE]);
+      } finally {
+        continueRender(handle);
+      }
+    })();
+  }, [handle]);
+
+  if (!images) return null;
+
+  const segmentLen = durationInFrames / images.length;
   const fadeFrames = 10;
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {IMAGES.map((src, i) => {
+      {images.map((src, i) => {
         const segStart = i * segmentLen;
         const localFrame = frame - segStart;
         if (localFrame < -fadeFrames || localFrame > segmentLen + fadeFrames) return null;
