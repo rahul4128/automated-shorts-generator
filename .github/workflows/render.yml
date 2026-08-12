@@ -41,8 +41,14 @@ jobs:
           mkdir -p public
           echo "${{ github.event.client_payload.scriptText }}" | piper --model models/hi_IN-rohan-medium.onnx --output_file public/audio.wav
 
+      - name: Save thumbnail image (same image used in the video)
+        run: |
+          mkdir -p out
+          curl -L -o out/thumbnail.jpg "${{ github.event.client_payload.imageUrl }}"
+
       - name: Render video
-        run: npx remotion render src/index.ts ShortVideo out/video.mp4 \
+        run: |
+          npx remotion render src/index.ts ShortVideo out/video.mp4 \
             --props="{\"imageUrl\":\"${{ github.event.client_payload.imageUrl }}\"}"
 
       - name: Upload video as artifact
@@ -51,8 +57,12 @@ jobs:
           name: rendered-video
           path: out/video.mp4
 
-      - name: Create release with video
+      - name: Create release with video, title, description, and thumbnail
         uses: softprops/action-gh-release@v2
         with:
           tag_name: video-${{ github.run_id }}
-          files: out/video.mp4
+          name: ${{ github.event.client_payload.title }}
+          body: ${{ github.event.client_payload.description }}
+          files: |
+            out/video.mp4
+            out/thumbnail.jpg
