@@ -42,7 +42,8 @@ jobs:
           echo "${{ github.event.client_payload.scriptText }}" | piper --model models/hi_IN-rohan-medium.onnx --output_file public/audio.wav
 
       - name: Render video
-        run: npx remotion render src/index.ts ShortVideo out/video.mp4
+        run: npx remotion render src/index.ts ShortVideo out/video.mp4 \
+            --props="{\"imageUrl\":\"${{ github.event.client_payload.imageUrl }}\"}"
 
       - name: Upload video as artifact
         uses: actions/upload-artifact@v4
