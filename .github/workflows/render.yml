@@ -21,6 +21,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install ffmpeg (required by Piper TTS and Remotion rendering)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install dependencies
         run: npm install
 
@@ -34,49 +37,21 @@ jobs:
           curl -L -o models/hi_IN-rohan-medium.onnx.json "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json"
 
       - name: Synthesize Hindi audio with Piper
-        env:
-          SCRIPT_TEXT: ${{ github.event.client_payload.scriptText }}
         run: |
           mkdir -p public
-          printf '%s' "$SCRIPT_TEXT" | piper --model models/hi_IN-rohan-medium.onnx --output_file public/audio.wav
+          echo "${{ github.event.client_payload.scriptText }}" | piper --model models/hi_IN-rohan-medium.onnx --output_file public/audio.wav
 
       - name: Render video
         run: npx remotion render src/index.ts ShortVideo out/video.mp4
-
-      - name: Extract thumbnail from video
-        run: |
-          mkdir -p out
-          ffmpeg -y -i out/video.mp4 -ss 1 -frames:v 1 out/thumbnail.jpg
-
-      - name: Save title and description
-        env:
-          VIDEO_TITLE: ${{ github.event.client_payload.videoTitle }}
-          VIDEO_DESCRIPTION: ${{ github.event.client_payload.videoDescription }}
-        run: |
-          printf '%s' "$VIDEO_TITLE" > out/title.txt
-          printf '%s' "$VIDEO_DESCRIPTION" > out/description.txt
 
       - name: Upload video as artifact
         uses: actions/upload-artifact@v4
         with:
           name: rendered-video
-          path: |
-            out/video.mp4
-            out/thumbnail.jpg
-            out/title.txt
-            out/description.txt
+          path: out/video.mp4
 
-      - name: Create release with video, thumbnail, title and description
-        env:
-          VIDEO_TITLE: ${{ github.event.client_payload.videoTitle }}
-          VIDEO_DESCRIPTION: ${{ github.event.client_payload.videoDescription }}
+      - name: Create release with video
         uses: softprops/action-gh-release@v2
         with:
           tag_name: video-${{ github.run_id }}
-          name: ${{ env.VIDEO_TITLE }}
-          body: ${{ env.VIDEO_DESCRIPTION }}
-          files: |
-            out/video.mp4
-            out/thumbnail.jpg
-            out/title.txt
-            out/description.txt
+          files: out/video.mp4
