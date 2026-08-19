@@ -59,23 +59,35 @@ jobs:
           restore-keys: |
             deps-${{ runner.os }}-
 
-      # ubuntu-latest runner images ship with ffmpeg preinstalled, so the
-      # `apt-get update && apt-get install ffmpeg` step in the original
-      # workflow almost always re-downloads package indexes for nothing —
-      # `apt-get update` alone commonly costs 30-60s. Only install if it's
-      # genuinely missing.
-      - name: Ensure ffmpeg is available
+      # This runner image doesn't have ffmpeg preinstalled, and `apt-get
+      # update` on this repo hit a slow/flaky azure.archive.ubuntu.com
+      # mirror — that's what actually got "stuck" (4+ minutes just
+      # refreshing package indexes, per the logs). Skip apt entirely and
+      # grab a static ffmpeg build directly from a fast CDN instead; it's
+      # a single ~80MB download with no mirror negotiation, and we cache
+      # it so subsequent runs don't even pay that.
+      - name: Cache static ffmpeg build
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/ffmpeg-static
+          key: ffmpeg-static-amd64-v1
+
+      - name: Install ffmpeg (static binary, no apt)
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            echo "ffmpeg not found, installing..."
-            sudo apt-get update -y
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
-          else
-            echo "ffmpeg already present: $(ffmpeg -version | head -n1)"
+          if [ ! -x /usr/local/bin/ffmpeg-static/ffmpeg ]; then
+            mkdir -p /usr/local/bin/ffmpeg-static
+            curl -fL --retry 3 --retry-delay 2 --max-time 120 \
+              -o /tmp/ffmpeg.tar.xz \
+              "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+            cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffmpeg-static/
           fi
-        env:
-          NEEDRESTART_MODE: a
-        timeout-minutes: 5
+          echo "/usr/local/bin/ffmpeg-static" >> "$GITHUB_PATH"
+        timeout-minutes: 3
+
+      - name: Verify ffmpeg
+        run: ffmpeg -version | head -n1
 
       # Cache the Piper voice model (it never changes) so it's downloaded
       # once instead of on every single run.
