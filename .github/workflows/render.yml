@@ -35,12 +35,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          # setup-node's built-in `cache: npm` hard-requires a committed
+          # package-lock.json/npm-shrinkwrap.json/yarn.lock and errors out
+          # without one. This repo doesn't have one committed, so we cache
+          # node_modules ourselves below (keyed on package.json) instead of
+          # relying on this option. Commit a package-lock.json if you can —
+          # it makes installs both faster and reproducible.
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          # Same story as above: pip's cache option wants a requirements
+          # file to key off of. We cache pip's download cache directly
+          # below instead.
+
+      - name: Cache node_modules and pip downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.cache/pip
+          key: deps-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
 
       # ubuntu-latest runner images ship with ffmpeg preinstalled, so the
       # `apt-get update && apt-get install ffmpeg` step in the original
@@ -87,7 +104,11 @@ jobs:
       - name: Install npm and pip dependencies (parallel)
         run: |
           set -e
-          npm ci &
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci &
+          else
+            npm install &
+          fi
           NPM_PID=$!
           pip install --disable-pip-version-check piper-tts &
           PIP_PID=$!
@@ -119,7 +140,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/remotion
-          key: remotion-browser-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
           restore-keys: |
             remotion-browser-${{ runner.os }}-
 
