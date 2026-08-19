@@ -2,57 +2,145 @@ name: Render Automated Video
 on:
   repository_dispatch:
     types: [trigger-render]
+
+# If a new render is triggered before the last one finishes, don't queue
+# behind it forever — cancel the stale run instead of piling up.
+concurrency:
+  group: render-automated-video
+  cancel-in-progress: true
+
 permissions:
   contents: write
+
 jobs:
   render:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # Pull everything out of github.event.client_payload up front and
+      # into env vars. Interpolating ${{ github.event.client_payload.* }}
+      # directly into a `run:` block is both a script-injection risk and
+      # the most likely cause of "gets stuck" — if the payload contains a
+      # stray quote, backtick, `$(...)`, or newline, the generated shell
+      # command silently breaks or waits on unmatched input instead of
+      # failing fast. Referencing $SCRIPT_TEXT etc. as a quoted shell
+      # variable avoids both problems.
+      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText }}
+      IMAGE_URL: ${{ github.event.client_payload.imageUrl }}
+      VIDEO_TITLE: ${{ github.event.client_payload.title }}
+      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install ffmpeg (required by Piper TTS and Remotion rendering)
+          cache: pip
+
+      # ubuntu-latest runner images ship with ffmpeg preinstalled, so the
+      # `apt-get update && apt-get install ffmpeg` step in the original
+      # workflow almost always re-downloads package indexes for nothing —
+      # `apt-get update` alone commonly costs 30-60s. Only install if it's
+      # genuinely missing.
+      - name: Ensure ffmpeg is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg not found, installing..."
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+          else
+            echo "ffmpeg already present: $(ffmpeg -version | head -n1)"
+          fi
         env:
-          DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: Install dependencies
-        run: npm install
-      - name: Install Piper TTS (open source, offline, no API/quota)
-        run: pip install piper-tts
+        timeout-minutes: 5
+
+      # Cache the Piper voice model (it never changes) so it's downloaded
+      # once instead of on every single run.
+      - name: Cache Piper voice model
+        id: cache-voice-model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: piper-voice-hi_IN-rohan-medium-v1
+
       - name: Download Hindi voice model
+        if: steps.cache-voice-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          curl -L -o models/hi_IN-rohan-medium.onnx "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx"
-          curl -L -o models/hi_IN-rohan-medium.onnx.json "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json"
-      - name: Synthesize Hindi audio with Piper
+          curl -fL --retry 3 --retry-delay 2 --max-time 120 \
+            -o models/hi_IN-rohan-medium.onnx \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx"
+          curl -fL --retry 3 --retry-delay 2 --max-time 60 \
+            -o models/hi_IN-rohan-medium.onnx.json \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json"
+        timeout-minutes: 5
+
+      # Install JS deps and Piper TTS in parallel — they're completely
+      # independent of each other and of ffmpeg/the model download above,
+      # so there's no reason to make them wait in a line.
+      - name: Install npm and pip dependencies (parallel)
         run: |
-          mkdir -p public
-          echo "${{ github.event.client_payload.scriptText }}" | piper --model models/hi_IN-rohan-medium.onnx --output_file public/audio.wav
+          set -e
+          npm ci &
+          NPM_PID=$!
+          pip install --disable-pip-version-check piper-tts &
+          PIP_PID=$!
+          wait $NPM_PID
+          wait $PIP_PID
+        timeout-minutes: 6
+
       - name: Save thumbnail image (same image used in the video)
         run: |
           mkdir -p out
-          curl -L -o out/thumbnail.jpg "${{ github.event.client_payload.imageUrl }}"
+          curl -fL --retry 3 --retry-delay 2 --max-time 60 \
+            -o out/thumbnail.jpg "$IMAGE_URL"
+        timeout-minutes: 3
+
+      - name: Synthesize Hindi audio with Piper
+        run: |
+          mkdir -p public
+          printf '%s' "$SCRIPT_TEXT" | piper \
+            --model models/hi_IN-rohan-medium.onnx \
+            --output_file public/audio.wav
+        timeout-minutes: 3
+
+      # On first use, Remotion downloads its own headless Chromium build
+      # (Chrome Headless Shell, ~100-200MB) to render with — that download
+      # is a common source of a render step that looks "stuck" for
+      # several minutes. Cache it so only the very first run ever pays
+      # that cost.
+      - name: Cache Remotion browser binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/remotion
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            remotion-browser-${{ runner.os }}-
+
       - name: Render video
         run: |
           npx remotion render src/index.ts ShortVideo out/video.mp4 \
-            --props="{\"imageUrl\":\"${{ github.event.client_payload.imageUrl }}\"}"
+            --props="$(node -e 'console.log(JSON.stringify({imageUrl: process.env.IMAGE_URL}))')"
+        timeout-minutes: 8
+
       - name: Upload video as artifact
         uses: actions/upload-artifact@v4
         with:
           name: rendered-video
           path: out/video.mp4
+
       - name: Create release with video, title, description, and thumbnail
         uses: softprops/action-gh-release@v2
         with:
           tag_name: video-${{ github.run_id }}
-          name: ${{ github.event.client_payload.title }}
-          body: ${{ github.event.client_payload.description }}
+          name: ${{ env.VIDEO_TITLE }}
+          body: ${{ env.VIDEO_DESCRIPTION }}
           files: |
             out/video.mp4
             out/thumbnail.jpg
