@@ -22,7 +22,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install ffmpeg (required by Piper TTS and Remotion rendering)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          sudo killall apt apt-get dpkg || true
+          sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+          echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/99force-yes
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
 
       - name: Install dependencies
         run: npm install
