@@ -3,24 +3,180 @@ on:
   repository_dispatch:
     types: [trigger-render]
 
+concurrency:
+  group: render-automated-video
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText }}
+      IMAGE_URL: ${{ github.event.client_payload.imageUrl }}
+      IMAGE_PROMPTS_JSON: ${{ toJSON(github.event.client_payload.imagePrompts) }}
+      VIDEO_TITLE: ${{ github.event.client_payload.title }}
+      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Install FFmpeg & System Dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Cache node_modules and pip downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.cache/pip
+          key: deps-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+      - name: Cache static ffmpeg build
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/ffmpeg-static
+          key: ffmpeg-static-amd64-v1
+      - name: Install ffmpeg (static binary, no apt)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libgbm-dev libnss3 libatk-bridge2.0-0 libgtk-3-0
-
-      - name: Debug Payload
+          if [ ! -x /usr/local/bin/ffmpeg-static/ffmpeg ]; then
+            mkdir -p /usr/local/bin/ffmpeg-static
+            curl -fL --retry 3 --retry-delay 2 --max-time 120 \
+              -o /tmp/ffmpeg.tar.xz \
+              "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+            cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffmpeg-static/
+          fi
+          echo "/usr/local/bin/ffmpeg-static" >> "$GITHUB_PATH"
+        timeout-minutes: 3
+      - name: Verify ffmpeg
+        run: ffmpeg -version | head -n1
+      - name: Cache Piper voice model
+        id: cache-voice-model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: piper-voice-hi_IN-rohan-medium-v1
+      - name: Download Hindi voice model
+        if: steps.cache-voice-model.outputs.cache-hit != 'true'
         run: |
-          echo "Audio URL: ${{ github.event.client_payload.audioUrl }}"
-          echo "Script text: ${{ github.event.client_payload.text }}"
+          mkdir -p models
+          curl -fL --retry 3 --retry-delay 2 --max-time 120 \
+            -o models/hi_IN-rohan-medium.onnx \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx"
+          curl -fL --retry 3 --retry-delay 2 --max-time 60 \
+            -o models/hi_IN-rohan-medium.onnx.json \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json"
+        timeout-minutes: 5
+      - name: Install npm and pip dependencies (parallel)
+        run: |
+          set -e
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci &
+          else
+            npm install &
+          fi
+          NPM_PID=$!
+          pip install --disable-pip-version-check piper-tts &
+          PIP_PID=$!
+          wait $NPM_PID
+          wait $PIP_PID
+        timeout-minutes: 6
+      - name: Download scene images
+        run: |
+          mkdir -p public/images out
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const https = require('https');
+
+          let prompts = [];
+          try {
+            prompts = JSON.parse(process.env.IMAGE_PROMPTS_JSON || '[]');
+          } catch (e) {
+            prompts = [];
+          }
+          if (!Array.isArray(prompts) || prompts.length === 0) {
+            prompts = [process.env.IMAGE_URL ? '' : ''];
+          }
+
+          function download(url, dest, attempt = 1) {
+            return new Promise((resolve, reject) => {
+              const file = fs.createWriteStream(dest);
+              https
+                .get(url, (res) => {
+                  if (res.statusCode !== 200) {
+                    file.close();
+                    fs.unlink(dest, () => {});
+                    if (attempt < 3) return resolve(download(url, dest, attempt + 1));
+                    return reject(new Error(`Failed ${url}: ${res.statusCode}`));
+                  }
+                  res.pipe(file);
+                  file.on('finish', () => file.close(() => resolve(undefined)));
+                })
+                .on('error', (err) => {
+                  if (attempt < 3) return resolve(download(url, dest, attempt + 1));
+                  reject(err);
+                });
+            });
+          }
+
+          (async () => {
+            const relPaths = [];
+            for (let i = 0; i < prompts.length; i++) {
+              const prompt = prompts[i] || 'devotional cinematic scene, vertical, warm lighting';
+              const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+                prompt
+              )}?width=1080&height=1920&nologo=true&seed=${i}`;
+              const rel = `images/scene-${i}.jpg`;
+              await download(url, path.join('public', rel));
+              relPaths.push(rel);
+              console.log(`Downloaded scene ${i}: ${prompt.slice(0, 60)}`);
+            }
+            fs.writeFileSync('out/images.json', JSON.stringify(relPaths));
+            fs.copyFileSync(path.join('public', relPaths[0]), 'out/thumbnail.jpg');
+          })().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+        timeout-minutes: 5
+      - name: Synthesize Hindi audio with Piper
+        run: |
+          mkdir -p public
+          printf '%s' "$SCRIPT_TEXT" | piper \
+            --model models/hi_IN-rohan-medium.onnx \
+            --output_file public/audio.wav
+        timeout-minutes: 3
+      - name: Cache Remotion browser binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/remotion
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+          restore-keys: |
+            remotion-browser-${{ runner.os }}-
+      - name: Render video
+        run: |
+          npx remotion render src/index.ts ShortVideo out/video.mp4 \
+            --props="$(node -e 'const fs=require("fs");const images=JSON.parse(fs.readFileSync("out/images.json","utf8"));console.log(JSON.stringify({images}))')"
+        timeout-minutes: 8
+      - name: Upload video as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-video
+          path: out/video.mp4
+      - name: Create release with video, title, description, and thumbnail
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: video-${{ github.run_id }}
+          name: ${{ env.VIDEO_TITLE }}
+          body: ${{ env.VIDEO_DESCRIPTION }}
+          files: |
+            out/video.mp4
+            out/thumbnail.jpg
