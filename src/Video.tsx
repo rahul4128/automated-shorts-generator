@@ -13,10 +13,18 @@ import {
 interface Props {
   audioUrl: string;
   imageUrl?: string; // legacy single-image fallback, kept for back-compat
-  images?: string[]; // new: one filename per story beat, relative to public/ (e.g. "images/scene-0.jpg")
+  images?: string[]; // new: one entry per story beat — either a remote https:// URL, or a filename relative to public/
 }
 
 const CROSSFADE_FRAMES = 12;
+
+// staticFile() only accepts local files under public/ and throws on remote
+// URLs — Remotion wants remote URLs passed to <Img> as-is instead. Since our
+// image sources can be either (a full pollinations.ai URL, or a local
+// "images/scene-0.jpg" path if a workflow step downloads them first), resolve
+// each case correctly here rather than assuming one or the other.
+const resolveImageSrc = (src: string): string =>
+  /^https?:\/\//i.test(src) ? src : staticFile(src);
 
 const Scene: React.FC<{ src: string; durationInFrames: number }> = ({
   src,
@@ -47,7 +55,7 @@ const Scene: React.FC<{ src: string; durationInFrames: number }> = ({
     <AbsoluteFill style={{ opacity }}>
       <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
         <Img
-          src={staticFile(src)}
+          src={resolveImageSrc(src)}
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
         />
       </AbsoluteFill>
