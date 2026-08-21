@@ -21,6 +21,7 @@ export const RemotionRoot: React.FC = () => {
       defaultProps={{
         audioUrl: audioFile,
         imageUrl: (inputProps as any).imageUrl || "",
+        images: (inputProps as any).images || [],
       }}
       calculateMetadata={async () => {
         let seconds = FALLBACK_SECONDS;
