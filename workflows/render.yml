@@ -109,11 +109,12 @@ jobs:
           function download(url, dest, attempt = 1) {
             return new Promise((resolve, reject) => {
               const file = fs.createWriteStream(dest);
-              https
+              const req = https
                 .get(url, (res) => {
                   if (res.statusCode !== 200) {
                     file.close();
                     fs.unlink(dest, () => {});
+                    res.resume();
                     if (attempt < 3) return resolve(download(url, dest, attempt + 1));
                     return reject(new Error(`Failed ${url}: ${res.statusCode}`));
                   }
@@ -121,24 +122,52 @@ jobs:
                   file.on('finish', () => file.close(() => resolve(undefined)));
                 })
                 .on('error', (err) => {
+                  file.close();
+                  fs.unlink(dest, () => {});
                   if (attempt < 3) return resolve(download(url, dest, attempt + 1));
                   reject(err);
                 });
+              // pollinations.ai generates images on demand and can occasionally
+              // hang instead of erroring out; force a retry if a single request
+              // takes too long rather than blocking the whole job.
+              req.setTimeout(45000, () => {
+                req.destroy(new Error('timeout'));
+              });
             });
           }
 
+          // Run downloads with limited concurrency instead of one-at-a-time.
+          // Sequential downloads were the cause of the 5-minute step timeout:
+          // pollinations.ai takes ~30-45s per image since it renders on request,
+          // so a dozen scenes done one after another can take 5-10+ minutes.
+          async function mapWithConcurrency(items, limit, fn) {
+            const results = new Array(items.length);
+            let next = 0;
+            async function worker() {
+              while (next < items.length) {
+                const i = next++;
+                results[i] = await fn(items[i], i);
+              }
+            }
+            await Promise.all(
+              Array.from({ length: Math.min(limit, items.length) }, worker)
+            );
+            return results;
+          }
+
           (async () => {
-            const relPaths = [];
-            for (let i = 0; i < prompts.length; i++) {
-              const prompt = prompts[i] || 'devotional cinematic scene, vertical, warm lighting';
+            const relPaths = new Array(prompts.length);
+            await mapWithConcurrency(prompts, 4, async (promptRaw, i) => {
+              const prompt =
+                promptRaw || 'devotional cinematic scene, vertical, warm lighting';
               const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
                 prompt
               )}?width=1080&height=1920&nologo=true&seed=${i}`;
               const rel = `images/scene-${i}.jpg`;
               await download(url, path.join('public', rel));
-              relPaths.push(rel);
+              relPaths[i] = rel;
               console.log(`Downloaded scene ${i}: ${prompt.slice(0, 60)}`);
-            }
+            });
             fs.writeFileSync('out/images.json', JSON.stringify(relPaths));
             fs.copyFileSync(path.join('public', relPaths[0]), 'out/thumbnail.jpg');
           })().catch((err) => {
@@ -146,7 +175,7 @@ jobs:
             process.exit(1);
           });
           EOF
-        timeout-minutes: 5
+        timeout-minutes: 8
       - name: Synthesize Hindi audio with Piper
         run: |
           mkdir -p public
