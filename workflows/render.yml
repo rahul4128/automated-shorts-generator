@@ -1,7 +1,30 @@
 name: Render Automated Video
+
 on:
   repository_dispatch:
     types: [trigger-render]
+  workflow_dispatch:
+    inputs:
+      scriptText:
+        description: 'Voiceover script text (Hindi)'
+        required: false
+        default: 'हरि ओम! आज का दिन मंगलमय हो।'
+        type: string
+      title:
+        description: 'Video Title'
+        required: false
+        default: 'Automated Short Video'
+        type: string
+      description:
+        description: 'Video Description'
+        required: false
+        default: 'Generated automatically via GitHub Actions.'
+        type: string
+      imagePrompts:
+        description: 'JSON array of image prompts'
+        required: false
+        default: '["devotional cinematic scene, vertical, warm lighting"]'
+        type: string
 
 concurrency:
   group: render-automated-video
@@ -15,11 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText }}
-      IMAGE_URL: ${{ github.event.client_payload.imageUrl }}
-      IMAGE_PROMPTS_JSON: ${{ toJSON(github.event.client_payload.imagePrompts) }}
-      VIDEO_TITLE: ${{ github.event.client_payload.title }}
-      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description }}
+      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText || inputs.scriptText }}
+      IMAGE_URL: ${{ github.event.client_payload.imageUrl || '' }}
+      IMAGE_PROMPTS_JSON: ${{ github.event.client_payload.imagePrompts || inputs.imagePrompts }}
+      VIDEO_TITLE: ${{ github.event.client_payload.title || inputs.title }}
+      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description || inputs.description }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -127,19 +150,12 @@ jobs:
                   if (attempt < 3) return resolve(download(url, dest, attempt + 1));
                   reject(err);
                 });
-              // pollinations.ai generates images on demand and can occasionally
-              // hang instead of erroring out; force a retry if a single request
-              // takes too long rather than blocking the whole job.
               req.setTimeout(45000, () => {
                 req.destroy(new Error('timeout'));
               });
             });
           }
 
-          // Run downloads with limited concurrency instead of one-at-a-time.
-          // Sequential downloads were the cause of the 5-minute step timeout:
-          // pollinations.ai takes ~30-45s per image since it renders on request,
-          // so a dozen scenes done one after another can take 5-10+ minutes.
           async function mapWithConcurrency(items, limit, fn) {
             const results = new Array(items.length);
             let next = 0;
