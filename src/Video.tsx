@@ -1,26 +1,90 @@
 import React from "react";
-import { AbsoluteFill, Audio, Img, useCurrentFrame, useVideoConfig, interpolate } from "remotion";
+import {
+  AbsoluteFill,
+  Audio,
+  Img,
+  Sequence,
+  staticFile,
+  useCurrentFrame,
+  useVideoConfig,
+  interpolate,
+} from "remotion";
 
 interface Props {
   audioUrl: string;
-  imageUrl: string;
+  imageUrl?: string; // legacy single-image fallback, kept for back-compat
+  images?: string[]; // new: one filename per story beat, relative to public/ (e.g. "images/scene-0.jpg")
 }
 
-export const ShortVideo: React.FC<Props> = ({ audioUrl, imageUrl }) => {
-  const frame = useCurrentFrame();
-  const { durationInFrames } = useVideoConfig();
+const CROSSFADE_FRAMES = 12;
 
-  // Single fresh AI-generated image for the whole video, with a gentle continuous zoom.
-  const zoom = interpolate(frame, [0, durationInFrames], [1, 1.15], {
+const Scene: React.FC<{ src: string; durationInFrames: number }> = ({
+  src,
+  durationInFrames,
+}) => {
+  const frame = useCurrentFrame();
+
+  // Gentle continuous zoom, same feel as before, but scoped to this scene only.
+  const zoom = interpolate(frame, [0, durationInFrames], [1, 1.12], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
   });
 
+  // Quick crossfade in/out at each scene boundary so cuts aren't jarring.
+  const fadeIn = interpolate(frame, [0, CROSSFADE_FRAMES], [0, 1], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - CROSSFADE_FRAMES, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  );
+  const opacity = Math.min(fadeIn, fadeOut);
+
+  return (
+    <AbsoluteFill style={{ opacity }}>
+      <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
+        <Img
+          src={staticFile(src)}
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+      </AbsoluteFill>
+    </AbsoluteFill>
+  );
+};
+
+export const ShortVideo: React.FC<Props> = ({ audioUrl, imageUrl, images }) => {
+  const { durationInFrames } = useVideoConfig();
+
+  // Prefer the new multi-image array; fall back to the old single image so
+  // nothing breaks if a caller still sends only `imageUrl`.
+  const scenes = images && images.length > 0 ? images : imageUrl ? [imageUrl] : [];
+
+  if (scenes.length === 0) {
+    return (
+      <AbsoluteFill style={{ backgroundColor: "black" }}>
+        {audioUrl ? <Audio src={audioUrl} /> : null}
+      </AbsoluteFill>
+    );
+  }
+
+  const perScene = Math.floor(durationInFrames / scenes.length);
+
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
-        <Img src={imageUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-      </AbsoluteFill>
+      {scenes.map((src, i) => {
+        const isLast = i === scenes.length - 1;
+        const from = perScene * i;
+        const sceneDuration = isLast ? durationInFrames - from : perScene;
+
+        return (
+          <Sequence key={`${i}-${src}`} from={from} durationInFrames={sceneDuration}>
+            <Scene src={src} durationInFrames={sceneDuration} />
+          </Sequence>
+        );
+      })}
       {audioUrl ? <Audio src={audioUrl} /> : null}
     </AbsoluteFill>
   );
