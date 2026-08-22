@@ -22,8 +22,19 @@ export const RemotionRoot: React.FC = () => {
         audioUrl: audioFile,
         imageUrl: (inputProps as any).imageUrl || "",
         images: (inputProps as any).images || [],
+        // Preferred prop: one entry per scene with its own measured
+        // narration duration, so Video.tsx can time each image to exactly
+        // how long its line takes to speak instead of splitting the total
+        // video length evenly across images. `images`/`imageUrl` above are
+        // kept only as a fallback for callers that haven't moved to this.
+        scenes: (inputProps as any).scenes || [],
       }}
       calculateMetadata={async () => {
+        // audio.wav is the concatenation of every scene's own clip (see the
+        // render workflow), so its total length already equals the sum of
+        // the per-scene durations in `scenes` — this stays the single
+        // source of truth for the video's overall length, with Video.tsx
+        // handling how that length is divided across scenes.
         let seconds = FALLBACK_SECONDS;
         try {
           const detected = await getAudioDurationInSeconds(audioFile);
