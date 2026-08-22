@@ -113,7 +113,13 @@ jobs:
           // Generic HTTPS GET with retry/backoff on 429/5xx (honoring
           // Retry-After when present) and a per-request timeout so a hung
           // connection doesn't block forever.
-          function get(url, attempt = 1, maxAttempts = 6) {
+          function get(url, opts = {}) {
+            const {
+              attempt = 1,
+              maxAttempts = 6,
+              baseBackoffMs = 2000,
+              capBackoffMs = 30000,
+            } = opts;
             return new Promise((resolve, reject) => {
               const req = https
                 .get(url, { headers: { 'User-Agent': 'automated-shorts-generator/1.0 (GitHub Actions render workflow)' } }, (res) => {
@@ -125,12 +131,12 @@ jobs:
                       const retryAfterSec = parseInt(res.headers['retry-after'] || '', 10);
                       const backoffMs = Number.isFinite(retryAfterSec)
                         ? retryAfterSec * 1000
-                        : Math.min(30000, 2000 * 2 ** (attempt - 1));
+                        : Math.min(capBackoffMs, baseBackoffMs * 2 ** (attempt - 1));
                       console.log(
                         `${url.split('?')[0]} -> ${res.statusCode}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
                       );
                       return sleep(backoffMs).then(() =>
-                        resolve(get(url, attempt + 1, maxAttempts))
+                        resolve(get(url, { ...opts, attempt: attempt + 1 }))
                       );
                     }
                     return reject(new Error(`Failed ${url}: ${res.statusCode}`));
@@ -141,9 +147,9 @@ jobs:
                 })
                 .on('error', (err) => {
                   if (attempt < maxAttempts) {
-                    const backoffMs = Math.min(30000, 2000 * 2 ** (attempt - 1));
+                    const backoffMs = Math.min(capBackoffMs, baseBackoffMs * 2 ** (attempt - 1));
                     return sleep(backoffMs).then(() =>
-                      resolve(get(url, attempt + 1, maxAttempts))
+                      resolve(get(url, { ...opts, attempt: attempt + 1 }))
                     );
                   }
                   reject(err);
@@ -154,8 +160,18 @@ jobs:
             });
           }
 
+          // upload.wikimedia.org (the CDN serving the actual image bytes,
+          // as opposed to the commons.wikimedia.org search API) rate-limits
+          // more aggressively — likely because GitHub Actions' shared
+          // runner IPs are also being used by many other concurrent jobs
+          // hitting the same CDN. Retry harder and slower here than for
+          // search requests.
           async function downloadToFile(url, dest) {
-            const buf = await get(url);
+            const buf = await get(url, {
+              maxAttempts: 6,
+              baseBackoffMs: 3000,
+              capBackoffMs: 20000,
+            });
             fs.writeFileSync(dest, buf);
           }
 
@@ -218,7 +234,8 @@ jobs:
             throw new Error(`No Commons results for scene ${i}`);
           }
 
-          // Keep concurrency modest and stagger requests slightly to be a
+          // Used only for the search phase, which has held up fine under
+          // modest concurrency. Keep it low and staggered anyway to be a
           // good citizen of a free, keyless API.
           async function mapWithConcurrency(items, limit, fn) {
             const results = new Array(items.length);
@@ -237,14 +254,26 @@ jobs:
           }
 
           (async () => {
+            // Phase 1: resolve a source image URL per scene by searching
+            // Commons. This hits the search API (commons.wikimedia.org),
+            // which has held up fine under modest concurrency.
+            const imageUrls = await mapWithConcurrency(prompts, 3, (promptRaw, i) =>
+              findImageUrl(promptRaw, i)
+            );
+
+            // Phase 2: download the actual image bytes serially, with a
+            // fixed gap between requests on top of per-request retry/
+            // backoff. This hits upload.wikimedia.org (the CDN), which
+            // is far more sensitive to bursts from a shared IP.
             const relPaths = new Array(prompts.length);
-            await mapWithConcurrency(prompts, 3, async (promptRaw, i) => {
-              const imgUrl = await findImageUrl(promptRaw, i);
+            for (let i = 0; i < imageUrls.length; i++) {
+              if (i > 0) await sleep(2000);
               const rel = `images/scene-${i}.jpg`;
-              await downloadToFile(imgUrl, path.join('public', rel));
+              await downloadToFile(imageUrls[i], path.join('public', rel));
               relPaths[i] = rel;
-              console.log(`Downloaded scene ${i}: ${(promptRaw || '').slice(0, 60)}`);
-            });
+              console.log(`Downloaded scene ${i}: ${(prompts[i] || '').slice(0, 60)}`);
+            }
+
             fs.writeFileSync('out/images.json', JSON.stringify(relPaths));
             fs.copyFileSync(path.join('public', relPaths[0]), 'out/thumbnail.jpg');
           })().catch((err) => {
