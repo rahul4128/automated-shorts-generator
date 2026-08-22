@@ -1,30 +1,26 @@
 name: Render Automated Video
-
 on:
   repository_dispatch:
     types: [trigger-render]
+  # Manual/test trigger — lets you run this from the Actions tab (or `gh
+  # workflow run render.yml`) without needing whatever external process
+  # normally fires the repository_dispatch event. All inputs have sensible
+  # defaults, so you can just hit "Run workflow" with no changes to smoke
+  # test the pipeline (image search, TTS, render, release).
   workflow_dispatch:
     inputs:
-      scriptText:
-        description: 'Voiceover script text (Hindi)'
+      scenes:
+        description: "JSON array of { text, imagePrompt } — one per scene, in order. Each scene's narration is synthesized separately so its image is shown for exactly as long as that line takes to speak."
         required: false
-        default: 'हरि ओम! आज का दिन मंगलमय हो।'
-        type: string
+        default: '[{"text":"श्री राम की महिमा अपरंपार है।","imagePrompt":"Rama and Sita in a forest, cinematic warm lighting, vertical"},{"text":"हनुमान जी की भक्ति और सेवा सबसे बड़ी शक्ति है।","imagePrompt":"Hanuman kneeling in devotion, golden hour, vertical"},{"text":"यह कथा हमें धर्म का मार्ग दिखाती है।","imagePrompt":"Ramayana temple scene, devotional, vertical"}]'
       title:
-        description: 'Video Title'
+        description: "Video title"
         required: false
-        default: 'Automated Short Video'
-        type: string
+        default: "Manual Test Render"
       description:
-        description: 'Video Description'
+        description: "Video description"
         required: false
-        default: 'Generated automatically via GitHub Actions.'
-        type: string
-      imagePrompts:
-        description: 'JSON array of image prompts'
-        required: false
-        default: '["devotional cinematic scene, vertical, warm lighting"]'
-        type: string
+        default: "Manual test run triggered via workflow_dispatch"
 
 concurrency:
   group: render-automated-video
@@ -36,13 +32,24 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
-      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText || inputs.scriptText }}
-      IMAGE_URL: ${{ github.event.client_payload.imageUrl || '' }}
-      IMAGE_PROMPTS_JSON: ${{ github.event.client_payload.imagePrompts || inputs.imagePrompts }}
-      VIDEO_TITLE: ${{ github.event.client_payload.title || inputs.title }}
-      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description || inputs.description }}
+      # Falls back to the workflow_dispatch input of the same name when
+      # there's no repository_dispatch client_payload (i.e. a manual run).
+      # SCENES_JSON is an array of { text, imagePrompt } — one entry per
+      # scene, in narration order. Pairing each line of the script with its
+      # own image prompt (instead of one big script blob + a separate,
+      # unlinked image-prompts array) is what lets each scene's image be
+      # timed to exactly how long that line takes to speak, instead of
+      # splitting the total video length evenly across images.
+      SCENES_JSON: ${{ (github.event.client_payload.scenes && toJSON(github.event.client_payload.scenes)) || github.event.inputs.scenes }}
+      VIDEO_TITLE: ${{ github.event.client_payload.title || github.event.inputs.title || 'Automated Video' }}
+      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description || github.event.inputs.description || '' }}
+      # Hugging Face access token with "Make calls to Inference Providers"
+      # permission — create one at huggingface.co/settings/tokens and add
+      # it as a repo secret named HF_TOKEN (Settings -> Secrets and
+      # variables -> Actions -> New repository secret).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -111,78 +118,146 @@ jobs:
           wait $NPM_PID
           wait $PIP_PID
         timeout-minutes: 6
-      - name: Download scene images
+      - name: Generate scene images
         run: |
           mkdir -p public/images out
           node <<'EOF'
           const fs = require('fs');
           const path = require('path');
-          const https = require('https');
+          const { InferenceClient } = require('@huggingface/inference');
 
-          let prompts = [];
+          let scenes = [];
           try {
-            prompts = JSON.parse(process.env.IMAGE_PROMPTS_JSON || '[]');
+            scenes = JSON.parse(process.env.SCENES_JSON || '[]');
           } catch (e) {
-            prompts = [];
+            scenes = [];
           }
-          if (!Array.isArray(prompts) || prompts.length === 0) {
-            prompts = [process.env.IMAGE_URL ? '' : ''];
+          if (!Array.isArray(scenes) || scenes.length === 0) {
+            console.error(
+              'SCENES_JSON is missing or empty. Send scenes as a JSON array of ' +
+                '{ text, imagePrompt } objects, one per scene, in narration order.'
+            );
+            process.exit(1);
+          }
+          const prompts = scenes.map((s) => (s && s.imagePrompt) || '');
+
+          const HF_TOKEN = process.env.HF_TOKEN;
+          const HF_MODEL = process.env.HF_IMAGE_MODEL || 'black-forest-labs/FLUX.1-schnell';
+
+          if (!HF_TOKEN) {
+            console.error(
+              'HF_TOKEN is not set. Create a token at huggingface.co/settings/tokens ' +
+                '(with "Make calls to Inference Providers" permission) and add it as a ' +
+                'repo secret named HF_TOKEN.'
+            );
+            process.exit(1);
           }
 
-          function download(url, dest, attempt = 1) {
-            return new Promise((resolve, reject) => {
-              const file = fs.createWriteStream(dest);
-              const req = https
-                .get(url, (res) => {
-                  if (res.statusCode !== 200) {
-                    file.close();
-                    fs.unlink(dest, () => {});
-                    res.resume();
-                    if (attempt < 3) return resolve(download(url, dest, attempt + 1));
-                    return reject(new Error(`Failed ${url}: ${res.statusCode}`));
-                  }
-                  res.pipe(file);
-                  file.on('finish', () => file.close(() => resolve(undefined)));
-                })
-                .on('error', (err) => {
-                  file.close();
-                  fs.unlink(dest, () => {});
-                  if (attempt < 3) return resolve(download(url, dest, attempt + 1));
-                  reject(err);
-                });
-              req.setTimeout(45000, () => {
-                req.destroy(new Error('timeout'));
+          function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+          }
+
+          // Which third-party backend (fal-ai, replicate, nscale, ...)
+          // actually serves a given model changes over time, and picking
+          // wrong fails outright ("Model not supported by provider ...").
+          // Rather than hardcoding one, ask the Hub directly which
+          // providers currently list this model "live" for text-to-image,
+          // and use the @huggingface/inference SDK (below) so each
+          // provider's own request/response shape is handled for us
+          // instead of us guessing it.
+          async function pickLiveProvider(modelId) {
+            const res = await fetch(
+              `https://huggingface.co/api/models/${modelId}?expand[]=inferenceProviderMapping`,
+              { headers: { Authorization: `Bearer ${HF_TOKEN}` } }
+            );
+            if (!res.ok) {
+              throw new Error(`Failed to fetch provider mapping for ${modelId}: HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            const mapping = data.inferenceProviderMapping || {};
+            const live = Object.entries(mapping)
+              .filter(([, info]) => info.status === 'live' && info.task === 'text-to-image')
+              .map(([provider]) => provider);
+            if (live.length === 0) {
+              throw new Error(`No live text-to-image provider found for model ${modelId}`);
+            }
+            return live[0];
+          }
+
+          const client = new InferenceClient(HF_TOKEN);
+
+          // Unlike a keyless search API over an existing image collection
+          // (Wikimedia, the Met), this actually generates a new image from
+          // the prompt — so scenes match the script instead of being the
+          // closest pre-existing photo/artwork we could find. Billed
+          // per-account against Hugging Face's Inference Providers credit,
+          // so it isn't subject to GitHub Actions' shared-IP rate limits
+          // the way anonymous services were.
+          //
+          // A cold model returns a 503 with an `estimated_time` (seconds)
+          // hint in the response body — honor that instead of guessing a
+          // backoff. Real quota/error responses (401 bad token, 402 out of
+          // credits, etc.) are not retried.
+          async function generateImage(provider, prompt, attempt = 1, maxAttempts = 6) {
+            try {
+              const blob = await client.textToImage({
+                provider,
+                model: HF_MODEL,
+                inputs: prompt || 'devotional cinematic scene, warm lighting',
               });
-            });
+              return Buffer.from(await blob.arrayBuffer());
+            } catch (err) {
+              const status = err && err.httpResponse && err.httpResponse.status;
+              const body = err && err.httpResponse && err.httpResponse.body;
+              const isRetryable = status === 429 || status === 503 || (typeof status === 'number' && status >= 500);
+              if (attempt < maxAttempts && isRetryable) {
+                const hintSeconds =
+                  body && typeof body === 'object' && typeof body.estimated_time === 'number'
+                    ? body.estimated_time
+                    : null;
+                const backoffMs = hintSeconds
+                  ? Math.ceil(hintSeconds * 1000) + 1000
+                  : Math.min(30000, 3000 * 2 ** (attempt - 1));
+                console.log(
+                  `HF generate -> ${err.message}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
+                );
+                await sleep(backoffMs);
+                return generateImage(provider, prompt, attempt + 1, maxAttempts);
+              }
+              throw new Error(`HF generate failed: ${err.message}`);
+            }
           }
 
+          // A couple of concurrent generations at a time — this is billed,
+          // compute-heavy work per request, not a free bulk API, so there's
+          // no need (or benefit) to hammer it with high concurrency.
           async function mapWithConcurrency(items, limit, fn) {
             const results = new Array(items.length);
             let next = 0;
-            async function worker() {
+            async function worker(workerIndex) {
+              await sleep(workerIndex * 500);
               while (next < items.length) {
                 const i = next++;
                 results[i] = await fn(items[i], i);
               }
             }
             await Promise.all(
-              Array.from({ length: Math.min(limit, items.length) }, worker)
+              Array.from({ length: Math.min(limit, items.length) }, (_, w) => worker(w))
             );
             return results;
           }
 
           (async () => {
+            const provider = await pickLiveProvider(HF_MODEL);
+            console.log(`Using provider "${provider}" for model ${HF_MODEL}`);
+
             const relPaths = new Array(prompts.length);
-            await mapWithConcurrency(prompts, 4, async (promptRaw, i) => {
-              const prompt =
-                promptRaw || 'devotional cinematic scene, vertical, warm lighting';
-              const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-                prompt
-              )}?width=1080&height=1920&nologo=true&seed=${i}`;
+            await mapWithConcurrency(prompts, 2, async (promptRaw, i) => {
+              const buf = await generateImage(provider, promptRaw);
               const rel = `images/scene-${i}.jpg`;
-              await download(url, path.join('public', rel));
+              fs.writeFileSync(path.join('public', rel), buf);
               relPaths[i] = rel;
-              console.log(`Downloaded scene ${i}: ${prompt.slice(0, 60)}`);
+              console.log(`Generated scene ${i}: ${(promptRaw || '').slice(0, 60)}`);
             });
             fs.writeFileSync('out/images.json', JSON.stringify(relPaths));
             fs.copyFileSync(path.join('public', relPaths[0]), 'out/thumbnail.jpg');
@@ -191,14 +266,110 @@ jobs:
             process.exit(1);
           });
           EOF
-        timeout-minutes: 8
-      - name: Synthesize Hindi audio with Piper
+        timeout-minutes: 12
+      - name: Synthesize per-scene audio and measure durations
         run: |
-          mkdir -p public
-          printf '%s' "$SCRIPT_TEXT" | piper \
-            --model models/hi_IN-rohan-medium.onnx \
-            --output_file public/audio.wav
-        timeout-minutes: 3
+          mkdir -p public/audio
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { spawnSync } = require('child_process');
+
+          let scenes = [];
+          try {
+            scenes = JSON.parse(process.env.SCENES_JSON || '[]');
+          } catch (e) {
+            scenes = [];
+          }
+          if (!Array.isArray(scenes) || scenes.length === 0) {
+            console.error(
+              'SCENES_JSON is missing or empty. Send scenes as a JSON array of ' +
+                '{ text, imagePrompt } objects, one per scene, in narration order.'
+            );
+            process.exit(1);
+          }
+
+          let images = [];
+          try {
+            images = JSON.parse(fs.readFileSync('out/images.json', 'utf8'));
+          } catch (e) {
+            console.error('Could not read out/images.json — did "Generate scene images" run first?');
+            process.exit(1);
+          }
+          if (images.length !== scenes.length) {
+            console.error(
+              `Scene/image count mismatch: ${scenes.length} scenes but ${images.length} images.`
+            );
+            process.exit(1);
+          }
+
+          function runOrThrow(cmd, args, opts = {}) {
+            const result = spawnSync(cmd, args, { encoding: 'utf8', ...opts });
+            if (result.error) throw result.error;
+            if (result.status !== 0) {
+              throw new Error(`${cmd} exited with ${result.status}: ${result.stderr || result.stdout}`);
+            }
+            return result;
+          }
+
+          // Synthesize each scene's narration into its own WAV file
+          // (rather than one big audio.wav for the whole script) so each
+          // scene has a real, measurable duration to time its image
+          // against — instead of splitting the total video length evenly
+          // across scenes regardless of how much each one says.
+          const sceneWavPaths = scenes.map((scene, i) => {
+            const text = (scene && scene.text) || '';
+            const wavPath = `public/audio/scene-${i}.wav`;
+            runOrThrow(
+              'piper',
+              ['--model', 'models/hi_IN-rohan-medium.onnx', '--output_file', wavPath],
+              { input: text }
+            );
+            console.log(`Synthesized scene ${i}: ${text.slice(0, 60)}`);
+            return wavPath;
+          });
+
+          const durationsInSeconds = sceneWavPaths.map((wavPath) => {
+            const result = runOrThrow('ffprobe', [
+              '-v', 'error',
+              '-show_entries', 'format=duration',
+              '-of', 'csv=p=0',
+              wavPath,
+            ]);
+            const seconds = parseFloat(result.stdout.trim());
+            if (!Number.isFinite(seconds) || seconds <= 0) {
+              throw new Error(`Could not measure duration of ${wavPath}`);
+            }
+            return seconds;
+          });
+
+          // Concatenate the per-scene clips into the single track Remotion
+          // plays. ffmpeg's concat demuxer re-muxes rather than blindly
+          // byte-copying, so each clip's own WAV header is handled correctly.
+          const listPath = 'public/audio/concat-list.txt';
+          fs.writeFileSync(
+            listPath,
+            sceneWavPaths.map((p) => `file '${path.resolve(p)}'`).join('\n')
+          );
+          runOrThrow('ffmpeg', [
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', listPath,
+            '-c', 'copy',
+            'public/audio.wav',
+          ]);
+
+          const combined = images.map((image, i) => ({
+            image,
+            durationInSeconds: durationsInSeconds[i],
+          }));
+          fs.writeFileSync('out/scenes.json', JSON.stringify(combined));
+
+          const total = durationsInSeconds.reduce((a, b) => a + b, 0);
+          console.log(`Total narration: ${total.toFixed(2)}s across ${combined.length} scenes`);
+          EOF
+        timeout-minutes: 5
       - name: Cache Remotion browser binary
         uses: actions/cache@v4
         with:
@@ -209,7 +380,7 @@ jobs:
       - name: Render video
         run: |
           npx remotion render src/index.ts ShortVideo out/video.mp4 \
-            --props="$(node -e 'const fs=require("fs");const images=JSON.parse(fs.readFileSync("out/images.json","utf8"));console.log(JSON.stringify({images}))')"
+            --props="$(node -e 'const fs=require("fs");const scenes=JSON.parse(fs.readFileSync("out/scenes.json","utf8"));console.log(JSON.stringify({scenes}))')"
         timeout-minutes: 8
       - name: Upload video as artifact
         uses: actions/upload-artifact@v4
