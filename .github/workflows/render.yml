@@ -103,28 +103,23 @@ jobs:
             prompts = [];
           }
           if (!Array.isArray(prompts) || prompts.length === 0) {
-            prompts = [process.env.IMAGE_URL ? '' : ''];
+            prompts = [''];
           }
 
           function sleep(ms) {
             return new Promise((resolve) => setTimeout(resolve, ms));
           }
 
-          // pollinations.ai rate-limits by IP (HTTP 429) and can also hang
-          // instead of erroring out. Retry with exponential backoff on
-          // 429/5xx (honoring Retry-After when present) instead of
-          // hammering it again immediately, and enforce a per-request
-          // timeout so a hung connection doesn't block forever.
-          function download(url, dest, attempt = 1, maxAttempts = 6) {
+          // Generic HTTPS GET with retry/backoff on 429/5xx (honoring
+          // Retry-After when present) and a per-request timeout so a hung
+          // connection doesn't block forever.
+          function get(url, attempt = 1, maxAttempts = 6) {
             return new Promise((resolve, reject) => {
-              const file = fs.createWriteStream(dest);
               const req = https
-                .get(url, (res) => {
+                .get(url, { headers: { 'User-Agent': 'automated-shorts-generator' } }, (res) => {
                   const isRetryableStatus =
                     res.statusCode === 429 || res.statusCode >= 500;
                   if (res.statusCode !== 200) {
-                    file.close();
-                    fs.unlink(dest, () => {});
                     res.resume();
                     if (attempt < maxAttempts && (isRetryableStatus || attempt < 3)) {
                       const retryAfterSec = parseInt(res.headers['retry-after'] || '', 10);
@@ -132,24 +127,23 @@ jobs:
                         ? retryAfterSec * 1000
                         : Math.min(30000, 2000 * 2 ** (attempt - 1));
                       console.log(
-                        `${url.split('/prompt/')[0]}... -> ${res.statusCode}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
+                        `${url.split('?')[0]} -> ${res.statusCode}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
                       );
                       return sleep(backoffMs).then(() =>
-                        resolve(download(url, dest, attempt + 1, maxAttempts))
+                        resolve(get(url, attempt + 1, maxAttempts))
                       );
                     }
                     return reject(new Error(`Failed ${url}: ${res.statusCode}`));
                   }
-                  res.pipe(file);
-                  file.on('finish', () => file.close(() => resolve(undefined)));
+                  const chunks = [];
+                  res.on('data', (c) => chunks.push(c));
+                  res.on('end', () => resolve(Buffer.concat(chunks)));
                 })
                 .on('error', (err) => {
-                  file.close();
-                  fs.unlink(dest, () => {});
                   if (attempt < maxAttempts) {
                     const backoffMs = Math.min(30000, 2000 * 2 ** (attempt - 1));
                     return sleep(backoffMs).then(() =>
-                      resolve(download(url, dest, attempt + 1, maxAttempts))
+                      resolve(get(url, attempt + 1, maxAttempts))
                     );
                   }
                   reject(err);
@@ -160,14 +154,72 @@ jobs:
             });
           }
 
-          // Keep concurrency low (2) — pollinations.ai's free/anonymous tier
-          // rate-limits bursts of parallel requests with 429s. A small
-          // stagger on top of that further spreads out the initial burst.
+          async function downloadToFile(url, dest) {
+            const buf = await get(url);
+            fs.writeFileSync(dest, buf);
+          }
+
+          // Lexica is a free, keyless, open search engine over existing
+          // Stable Diffusion generations — it doesn't generate images
+          // on-demand (unlike pollinations.ai), so it isn't subject to the
+          // same per-IP generation rate limits.
+          async function searchLexica(query) {
+            const url = `https://lexica.art/api/v1/search?q=${encodeURIComponent(query)}`;
+            const buf = await get(url);
+            const data = JSON.parse(buf.toString('utf8'));
+            return Array.isArray(data.images) ? data.images : [];
+          }
+
+          function shortenQuery(query) {
+            // Lexica's search works best on a handful of keywords rather
+            // than a long, comma-separated cinematic prompt. Fall back to
+            // progressively shorter/simpler queries if a full prompt
+            // returns no matches.
+            const firstClause = query.split(',')[0];
+            const words = firstClause.trim().split(/\s+/).slice(0, 6).join(' ');
+            return words;
+          }
+
+          async function findImageUrl(promptRaw, i) {
+            const prompt =
+              promptRaw || 'devotional cinematic scene, warm lighting';
+            const candidates = [
+              prompt,
+              shortenQuery(prompt),
+              'hindu devotional temple painting',
+            ];
+            for (const query of candidates) {
+              if (!query) continue;
+              let images = [];
+              try {
+                images = await searchLexica(query);
+              } catch (err) {
+                console.log(`Lexica search failed for "${query.slice(0, 60)}": ${err.message}`);
+                continue;
+              }
+              const safeImages = images.filter((img) => !img.nsfw);
+              if (safeImages.length > 0) {
+                images = safeImages;
+              }
+              if (images.length > 0) {
+                const pick = images[i % images.length];
+                const imgUrl = pick.src || pick.srcSmall;
+                if (imgUrl) {
+                  console.log(`Scene ${i}: matched "${query.slice(0, 60)}" (${images.length} results)`);
+                  return imgUrl;
+                }
+              }
+            }
+            throw new Error(`No Lexica results for scene ${i}`);
+          }
+
+          // Keep concurrency modest and stagger requests slightly to be a
+          // good citizen of a free, keyless API.
           async function mapWithConcurrency(items, limit, fn) {
             const results = new Array(items.length);
             let next = 0;
             async function worker(workerIndex) {
-              await sleep(workerIndex * 1500);
+              await sleep(workerIndex * 1000);
               while (next < items.length) {
                 const i = next++;
                 results[i] = await fn(items[i], i);
@@ -181,16 +233,12 @@ jobs:
 
           (async () => {
             const relPaths = new Array(prompts.length);
-            await mapWithConcurrency(prompts, 2, async (promptRaw, i) => {
-              const prompt =
-                promptRaw || 'devotional cinematic scene, vertical, warm lighting';
-              const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-                prompt
-              )}?width=1080&height=1920&nologo=true&seed=${i}`;
+            await mapWithConcurrency(prompts, 3, async (promptRaw, i) => {
+              const imgUrl = await findImageUrl(promptRaw, i);
               const rel = `images/scene-${i}.jpg`;
-              await download(url, path.join('public', rel));
+              await downloadToFile(imgUrl, path.join('public', rel));
               relPaths[i] = rel;
-              console.log(`Downloaded scene ${i}: ${prompt.slice(0, 60)}`);
+              console.log(`Downloaded scene ${i}: ${(promptRaw || '').slice(0, 60)}`);
             });
             fs.writeFileSync('out/images.json', JSON.stringify(relPaths));
             fs.copyFileSync(path.join('public', relPaths[0]), 'out/thumbnail.jpg');
