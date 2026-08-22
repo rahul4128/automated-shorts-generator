@@ -9,14 +9,10 @@ on:
   # test the pipeline (image search, TTS, render, release).
   workflow_dispatch:
     inputs:
-      scriptText:
-        description: "Hindi narration script for Piper TTS"
+      scenes:
+        description: "JSON array of { text, imagePrompt } — one per scene, in order. Each scene's narration is synthesized separately so its image is shown for exactly as long as that line takes to speak."
         required: false
-        default: "श्री राम की महिमा अपरंपार है। हनुमान जी की भक्ति और सेवा सबसे बड़ी शक्ति है।"
-      imagePrompts:
-        description: "JSON array of per-scene image generation prompts"
-        required: false
-        default: '["Rama and Sita in a forest, cinematic warm lighting, vertical", "Hanuman kneeling in devotion, golden hour, vertical", "Ramayana temple scene, devotional, vertical"]'
+        default: '[{"text":"श्री राम की महिमा अपरंपार है।","imagePrompt":"Rama and Sita in a forest, cinematic warm lighting, vertical"},{"text":"हनुमान जी की भक्ति और सेवा सबसे बड़ी शक्ति है।","imagePrompt":"Hanuman kneeling in devotion, golden hour, vertical"},{"text":"यह कथा हमें धर्म का मार्ग दिखाती है।","imagePrompt":"Ramayana temple scene, devotional, vertical"}]'
       title:
         description: "Video title"
         required: false
@@ -40,9 +36,13 @@ jobs:
     env:
       # Falls back to the workflow_dispatch input of the same name when
       # there's no repository_dispatch client_payload (i.e. a manual run).
-      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText || github.event.inputs.scriptText }}
-      IMAGE_URL: ${{ github.event.client_payload.imageUrl }}
-      IMAGE_PROMPTS_JSON: ${{ (github.event.client_payload.imagePrompts && toJSON(github.event.client_payload.imagePrompts)) || github.event.inputs.imagePrompts }}
+      # SCENES_JSON is an array of { text, imagePrompt } — one entry per
+      # scene, in narration order. Pairing each line of the script with its
+      # own image prompt (instead of one big script blob + a separate,
+      # unlinked image-prompts array) is what lets each scene's image be
+      # timed to exactly how long that line takes to speak, instead of
+      # splitting the total video length evenly across images.
+      SCENES_JSON: ${{ (github.event.client_payload.scenes && toJSON(github.event.client_payload.scenes)) || github.event.inputs.scenes }}
       VIDEO_TITLE: ${{ github.event.client_payload.title || github.event.inputs.title || 'Automated Video' }}
       VIDEO_DESCRIPTION: ${{ github.event.client_payload.description || github.event.inputs.description || '' }}
       # Hugging Face access token with "Make calls to Inference Providers"
@@ -126,15 +126,20 @@ jobs:
           const path = require('path');
           const { InferenceClient } = require('@huggingface/inference');
 
-          let prompts = [];
+          let scenes = [];
           try {
-            prompts = JSON.parse(process.env.IMAGE_PROMPTS_JSON || '[]');
+            scenes = JSON.parse(process.env.SCENES_JSON || '[]');
           } catch (e) {
-            prompts = [];
+            scenes = [];
           }
-          if (!Array.isArray(prompts) || prompts.length === 0) {
-            prompts = [''];
+          if (!Array.isArray(scenes) || scenes.length === 0) {
+            console.error(
+              'SCENES_JSON is missing or empty. Send scenes as a JSON array of ' +
+                '{ text, imagePrompt } objects, one per scene, in narration order.'
+            );
+            process.exit(1);
           }
+          const prompts = scenes.map((s) => (s && s.imagePrompt) || '');
 
           const HF_TOKEN = process.env.HF_TOKEN;
           const HF_MODEL = process.env.HF_IMAGE_MODEL || 'black-forest-labs/FLUX.1-schnell';
@@ -262,13 +267,109 @@ jobs:
           });
           EOF
         timeout-minutes: 12
-      - name: Synthesize Hindi audio with Piper
+      - name: Synthesize per-scene audio and measure durations
         run: |
-          mkdir -p public
-          printf '%s' "$SCRIPT_TEXT" | piper \
-            --model models/hi_IN-rohan-medium.onnx \
-            --output_file public/audio.wav
-        timeout-minutes: 3
+          mkdir -p public/audio
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { spawnSync } = require('child_process');
+
+          let scenes = [];
+          try {
+            scenes = JSON.parse(process.env.SCENES_JSON || '[]');
+          } catch (e) {
+            scenes = [];
+          }
+          if (!Array.isArray(scenes) || scenes.length === 0) {
+            console.error(
+              'SCENES_JSON is missing or empty. Send scenes as a JSON array of ' +
+                '{ text, imagePrompt } objects, one per scene, in narration order.'
+            );
+            process.exit(1);
+          }
+
+          let images = [];
+          try {
+            images = JSON.parse(fs.readFileSync('out/images.json', 'utf8'));
+          } catch (e) {
+            console.error('Could not read out/images.json — did "Generate scene images" run first?');
+            process.exit(1);
+          }
+          if (images.length !== scenes.length) {
+            console.error(
+              `Scene/image count mismatch: ${scenes.length} scenes but ${images.length} images.`
+            );
+            process.exit(1);
+          }
+
+          function runOrThrow(cmd, args, opts = {}) {
+            const result = spawnSync(cmd, args, { encoding: 'utf8', ...opts });
+            if (result.error) throw result.error;
+            if (result.status !== 0) {
+              throw new Error(`${cmd} exited with ${result.status}: ${result.stderr || result.stdout}`);
+            }
+            return result;
+          }
+
+          // Synthesize each scene's narration into its own WAV file
+          // (rather than one big audio.wav for the whole script) so each
+          // scene has a real, measurable duration to time its image
+          // against — instead of splitting the total video length evenly
+          // across scenes regardless of how much each one says.
+          const sceneWavPaths = scenes.map((scene, i) => {
+            const text = (scene && scene.text) || '';
+            const wavPath = `public/audio/scene-${i}.wav`;
+            runOrThrow(
+              'piper',
+              ['--model', 'models/hi_IN-rohan-medium.onnx', '--output_file', wavPath],
+              { input: text }
+            );
+            console.log(`Synthesized scene ${i}: ${text.slice(0, 60)}`);
+            return wavPath;
+          });
+
+          const durationsInSeconds = sceneWavPaths.map((wavPath) => {
+            const result = runOrThrow('ffprobe', [
+              '-v', 'error',
+              '-show_entries', 'format=duration',
+              '-of', 'csv=p=0',
+              wavPath,
+            ]);
+            const seconds = parseFloat(result.stdout.trim());
+            if (!Number.isFinite(seconds) || seconds <= 0) {
+              throw new Error(`Could not measure duration of ${wavPath}`);
+            }
+            return seconds;
+          });
+
+          // Concatenate the per-scene clips into the single track Remotion
+          // plays. ffmpeg's concat demuxer re-muxes rather than blindly
+          // byte-copying, so each clip's own WAV header is handled correctly.
+          const listPath = 'public/audio/concat-list.txt';
+          fs.writeFileSync(
+            listPath,
+            sceneWavPaths.map((p) => `file '${path.resolve(p)}'`).join('\n')
+          );
+          runOrThrow('ffmpeg', [
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', listPath,
+            '-c', 'copy',
+            'public/audio.wav',
+          ]);
+
+          const combined = images.map((image, i) => ({
+            image,
+            durationInSeconds: durationsInSeconds[i],
+          }));
+          fs.writeFileSync('out/scenes.json', JSON.stringify(combined));
+
+          const total = durationsInSeconds.reduce((a, b) => a + b, 0);
+          console.log(`Total narration: ${total.toFixed(2)}s across ${combined.length} scenes`);
+          EOF
+        timeout-minutes: 5
       - name: Cache Remotion browser binary
         uses: actions/cache@v4
         with:
@@ -279,7 +380,7 @@ jobs:
       - name: Render video
         run: |
           npx remotion render src/index.ts ShortVideo out/video.mp4 \
-            --props="$(node -e 'const fs=require("fs");const images=JSON.parse(fs.readFileSync("out/images.json","utf8"));console.log(JSON.stringify({images}))')"
+            --props="$(node -e 'const fs=require("fs");const scenes=JSON.parse(fs.readFileSync("out/scenes.json","utf8"));console.log(JSON.stringify({scenes}))')"
         timeout-minutes: 8
       - name: Upload video as artifact
         uses: actions/upload-artifact@v4
