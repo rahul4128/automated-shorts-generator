@@ -10,10 +10,16 @@ import {
   interpolate,
 } from "remotion";
 
+interface SceneInput {
+  image: string; // remote https:// URL, or a filename relative to public/
+  durationInSeconds: number; // measured length of this scene's own narration clip
+}
+
 interface Props {
   audioUrl: string;
   imageUrl?: string; // legacy single-image fallback, kept for back-compat
-  images?: string[]; // new: one entry per story beat — either a remote https:// URL, or a filename relative to public/
+  images?: string[]; // legacy: one entry per story beat, split evenly across the total duration
+  scenes?: SceneInput[]; // preferred: each scene carries its own measured narration duration
 }
 
 const CROSSFADE_FRAMES = 12;
@@ -63,14 +69,66 @@ const Scene: React.FC<{ src: string; durationInFrames: number }> = ({
   );
 };
 
-export const ShortVideo: React.FC<Props> = ({ audioUrl, imageUrl, images }) => {
-  const { durationInFrames } = useVideoConfig();
+interface PlacedScene {
+  src: string;
+  from: number;
+  durationInFrames: number;
+}
 
-  // Prefer the new multi-image array; fall back to the old single image so
-  // nothing breaks if a caller still sends only `imageUrl`.
-  const scenes = images && images.length > 0 ? images : imageUrl ? [imageUrl] : [];
+// Lays scenes out back-to-back starting at frame 0, using each scene's own
+// nominal duration — except the last scene, which always absorbs whatever
+// frames remain up to `totalFrames`. That guarantees the scenes exactly
+// cover the whole video with no gap or overshoot, regardless of rounding
+// (real seconds -> frames) or an odd division (legacy equal split).
+const layoutScenes = (
+  items: { src: string; durationInFrames: number }[],
+  totalFrames: number
+): PlacedScene[] => {
+  let from = 0;
+  return items.map((item, i) => {
+    const isLast = i === items.length - 1;
+    const durationInFrames = isLast
+      ? Math.max(1, totalFrames - from)
+      : item.durationInFrames;
+    const placed = { src: item.src, from, durationInFrames };
+    from += durationInFrames;
+    return placed;
+  });
+};
 
-  if (scenes.length === 0) {
+export const ShortVideo: React.FC<Props> = ({
+  audioUrl,
+  imageUrl,
+  images,
+  scenes,
+}) => {
+  const { durationInFrames, fps } = useVideoConfig();
+
+  // Preferred: each scene's image is shown for exactly as long as its own
+  // measured narration clip takes, so a short line's image doesn't linger
+  // and a long line's image doesn't get cut off early. Falls back to an
+  // even split (`images`) or a single static image (`imageUrl`) only for
+  // callers that haven't moved to sending per-scene durations.
+  const placedScenes: PlacedScene[] = (() => {
+    if (scenes && scenes.length > 0) {
+      const withFrames = scenes.map((s) => ({
+        src: s.image,
+        durationInFrames: Math.max(1, Math.round(s.durationInSeconds * fps)),
+      }));
+      return layoutScenes(withFrames, durationInFrames);
+    }
+    if (images && images.length > 0) {
+      const perScene = Math.max(1, Math.floor(durationInFrames / images.length));
+      const withFrames = images.map((src) => ({ src, durationInFrames: perScene }));
+      return layoutScenes(withFrames, durationInFrames);
+    }
+    if (imageUrl) {
+      return [{ src: imageUrl, from: 0, durationInFrames }];
+    }
+    return [];
+  })();
+
+  if (placedScenes.length === 0) {
     return (
       <AbsoluteFill style={{ backgroundColor: "black" }}>
         {audioUrl ? <Audio src={audioUrl} /> : null}
@@ -78,21 +136,13 @@ export const ShortVideo: React.FC<Props> = ({ audioUrl, imageUrl, images }) => {
     );
   }
 
-  const perScene = Math.floor(durationInFrames / scenes.length);
-
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
-      {scenes.map((src, i) => {
-        const isLast = i === scenes.length - 1;
-        const from = perScene * i;
-        const sceneDuration = isLast ? durationInFrames - from : perScene;
-
-        return (
-          <Sequence key={`${i}-${src}`} from={from} durationInFrames={sceneDuration}>
-            <Scene src={src} durationInFrames={sceneDuration} />
-          </Sequence>
-        );
-      })}
+      {placedScenes.map(({ src, from, durationInFrames: sceneDuration }, i) => (
+        <Sequence key={`${i}-${src}`} from={from} durationInFrames={sceneDuration}>
+          <Scene src={src} durationInFrames={sceneDuration} />
+        </Sequence>
+      ))}
       {audioUrl ? <Audio src={audioUrl} /> : null}
     </AbsoluteFill>
   );
