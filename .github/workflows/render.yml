@@ -116,7 +116,7 @@ jobs:
           function get(url, attempt = 1, maxAttempts = 6) {
             return new Promise((resolve, reject) => {
               const req = https
-                .get(url, { headers: { 'User-Agent': 'automated-shorts-generator' } }, (res) => {
+                .get(url, { headers: { 'User-Agent': 'automated-shorts-generator/1.0 (GitHub Actions render workflow)' } }, (res) => {
                   const isRetryableStatus =
                     res.statusCode === 429 || res.statusCode >= 500;
                   if (res.statusCode !== 200) {
@@ -159,22 +159,31 @@ jobs:
             fs.writeFileSync(dest, buf);
           }
 
-          // Lexica is a free, keyless, open search engine over existing
-          // Stable Diffusion generations — it doesn't generate images
-          // on-demand (unlike pollinations.ai), so it isn't subject to the
-          // same per-IP generation rate limits.
-          async function searchLexica(query) {
-            const url = `https://lexica.art/api/v1/search?q=${encodeURIComponent(query)}`;
+          // Lexica sits behind an anti-bot edge (Cloudflare-style) that
+          // resets the TLS handshake for GitHub Actions' datacenter IP
+          // ranges — a documented, unfixable-from-our-side problem, not a
+          // query/rate-limit issue. Wikimedia Commons is a better fit for
+          // CI: it's a free, keyless, script-friendly API (Wikimedia
+          // explicitly documents bot access; it just asks for a
+          // descriptive User-Agent, set above) backed by its own CDN
+          // rather than a third-party bot wall, and it has a huge library
+          // of public-domain/CC devotional and mythological art.
+          async function searchCommons(query) {
+            const url =
+              'https://commons.wikimedia.org/w/api.php?action=query&generator=search' +
+              `&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=8` +
+              '&prop=imageinfo&iiprop=url|mime&iiurlwidth=1080&format=json';
             const buf = await get(url);
             const data = JSON.parse(buf.toString('utf8'));
-            return Array.isArray(data.images) ? data.images : [];
+            const pages = (data.query && data.query.pages) || {};
+            return Object.values(pages);
           }
 
           function shortenQuery(query) {
-            // Lexica's search works best on a handful of keywords rather
-            // than a long, comma-separated cinematic prompt. Fall back to
-            // progressively shorter/simpler queries if a full prompt
-            // returns no matches.
+            // Commons full-text search works best on a handful of keywords
+            // rather than a long, comma-separated cinematic prompt. Fall
+            // back to progressively shorter/simpler queries if a full
+            // prompt returns no matches.
             const firstClause = query.split(',')[0];
             const words = firstClause.trim().split(/\s+/).slice(0, 6).join(' ');
             return words;
@@ -186,31 +195,27 @@ jobs:
             const candidates = [
               prompt,
               shortenQuery(prompt),
-              'hindu devotional temple painting',
+              'Hindu mythology painting',
             ];
             for (const query of candidates) {
               if (!query) continue;
-              let images = [];
+              let pages = [];
               try {
-                images = await searchLexica(query);
+                pages = await searchCommons(query);
               } catch (err) {
-                console.log(`Lexica search failed for "${query.slice(0, 60)}": ${err.message}`);
+                console.log(`Commons search failed for "${query.slice(0, 60)}": ${err.message}`);
                 continue;
               }
-              const safeImages = images.filter((img) => !img.nsfw);
-              if (safeImages.length > 0) {
-                images = safeImages;
-              }
-              if (images.length > 0) {
-                const pick = images[i % images.length];
-                const imgUrl = pick.src || pick.srcSmall;
-                if (imgUrl) {
-                  console.log(`Scene ${i}: matched "${query.slice(0, 60)}" (${images.length} results)`);
-                  return imgUrl;
-                }
+              const usable = pages
+                .map((p) => p.imageinfo && p.imageinfo[0])
+                .filter((info) => info && (info.mime === 'image/jpeg' || info.mime === 'image/png'))
+                .map((info) => info.thumburl || info.url);
+              if (usable.length > 0) {
+                console.log(`Scene ${i}: matched "${query.slice(0, 60)}" (${usable.length} results)`);
+                return usable[i % usable.length];
               }
             }
-            throw new Error(`No Lexica results for scene ${i}`);
+            throw new Error(`No Commons results for scene ${i}`);
           }
 
           // Keep concurrency modest and stagger requests slightly to be a
