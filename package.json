@@ -6,6 +6,7 @@
     "render": "remotion render src/index.ts ShortVideo out/video.mp4"
   },
   "dependencies": {
+    "@huggingface/inference": "4.13.28",
     "@remotion/cli": "4.0.507",
     "@remotion/renderer": "4.0.507",
     "@remotion/media-utils": "4.0.507",
