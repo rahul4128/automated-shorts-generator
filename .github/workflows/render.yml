@@ -2,6 +2,29 @@ name: Render Automated Video
 on:
   repository_dispatch:
     types: [trigger-render]
+  # Manual/test trigger — lets you run this from the Actions tab (or `gh
+  # workflow run render.yml`) without needing whatever external process
+  # normally fires the repository_dispatch event. All inputs have sensible
+  # defaults, so you can just hit "Run workflow" with no changes to smoke
+  # test the pipeline (image search, TTS, render, release).
+  workflow_dispatch:
+    inputs:
+      scriptText:
+        description: "Hindi narration script for Piper TTS"
+        required: false
+        default: "श्री राम की महिमा अपरंपार है। हनुमान जी की भक्ति और सेवा सबसे बड़ी शक्ति है।"
+      imagePrompts:
+        description: "JSON array of per-scene image search prompts"
+        required: false
+        default: '["Rama and Sita painting", "Hanuman devotion painting", "Ramayana temple scene"]'
+      title:
+        description: "Video title"
+        required: false
+        default: "Manual Test Render"
+      description:
+        description: "Video description"
+        required: false
+        default: "Manual test run triggered via workflow_dispatch"
 
 concurrency:
   group: render-automated-video
@@ -15,11 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText }}
+      # Falls back to the workflow_dispatch input of the same name when
+      # there's no repository_dispatch client_payload (i.e. a manual run).
+      SCRIPT_TEXT: ${{ github.event.client_payload.scriptText || github.event.inputs.scriptText }}
       IMAGE_URL: ${{ github.event.client_payload.imageUrl }}
-      IMAGE_PROMPTS_JSON: ${{ toJSON(github.event.client_payload.imagePrompts) }}
-      VIDEO_TITLE: ${{ github.event.client_payload.title }}
-      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description }}
+      IMAGE_PROMPTS_JSON: ${{ (github.event.client_payload.imagePrompts && toJSON(github.event.client_payload.imagePrompts)) || github.event.inputs.imagePrompts }}
+      VIDEO_TITLE: ${{ github.event.client_payload.title || github.event.inputs.title || 'Automated Video' }}
+      VIDEO_DESCRIPTION: ${{ github.event.client_payload.description || github.event.inputs.description || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -160,46 +185,43 @@ jobs:
             });
           }
 
-          // upload.wikimedia.org (the CDN serving the actual image bytes,
-          // as opposed to the commons.wikimedia.org search API) rate-limits
-          // more aggressively — likely because GitHub Actions' shared
-          // runner IPs are also being used by many other concurrent jobs
-          // hitting the same CDN. Retry harder and slower here than for
-          // search requests.
           async function downloadToFile(url, dest) {
             const buf = await get(url, {
               maxAttempts: 6,
-              baseBackoffMs: 3000,
-              capBackoffMs: 20000,
+              baseBackoffMs: 2000,
+              capBackoffMs: 15000,
             });
             fs.writeFileSync(dest, buf);
           }
 
-          // Lexica sits behind an anti-bot edge (Cloudflare-style) that
-          // resets the TLS handshake for GitHub Actions' datacenter IP
-          // ranges — a documented, unfixable-from-our-side problem, not a
-          // query/rate-limit issue. Wikimedia Commons is a better fit for
-          // CI: it's a free, keyless, script-friendly API (Wikimedia
-          // explicitly documents bot access; it just asks for a
-          // descriptive User-Agent, set above) backed by its own CDN
-          // rather than a third-party bot wall, and it has a huge library
-          // of public-domain/CC devotional and mythological art.
-          async function searchCommons(query) {
-            const url =
-              'https://commons.wikimedia.org/w/api.php?action=query&generator=search' +
-              `&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=8` +
-              '&prop=imageinfo&iiprop=url|mime&iiurlwidth=1080&format=json';
+          // Wikimedia has been publicly fighting a surge in automated/AI
+          // crawler traffic since 2025 and has responded by throttling
+          // datacenter/bot-like traffic much harder — which is why both
+          // its search API and its image CDN kept 429ing GitHub Actions'
+          // shared runner IPs no matter how much we slowed down. The Met
+          // Museum's Open Access API is a better fit for CI: it's free,
+          // keyless, explicitly built and scaled for open bulk/
+          // programmatic reuse (no crawler crackdown to get caught in),
+          // and its Asian Art department holds a large collection of
+          // Ramayana and Hindu devotional paintings/sculpture.
+          async function searchMet(query) {
+            const url = `https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${encodeURIComponent(query)}`;
             const buf = await get(url);
             const data = JSON.parse(buf.toString('utf8'));
-            const pages = (data.query && data.query.pages) || {};
-            return Object.values(pages);
+            return Array.isArray(data.objectIDs) ? data.objectIDs : [];
+          }
+
+          async function getMetObject(id) {
+            const url = `https://collectionapi.metmuseum.org/public/collection/v1/objects/${id}`;
+            const buf = await get(url);
+            return JSON.parse(buf.toString('utf8'));
           }
 
           function shortenQuery(query) {
-            // Commons full-text search works best on a handful of keywords
-            // rather than a long, comma-separated cinematic prompt. Fall
-            // back to progressively shorter/simpler queries if a full
-            // prompt returns no matches.
+            // The Met's search works best on a handful of keywords rather
+            // than a long, comma-separated cinematic prompt. Fall back to
+            // progressively shorter/simpler queries if a full prompt
+            // returns no matches.
             const firstClause = query.split(',')[0];
             const words = firstClause.trim().split(/\s+/).slice(0, 6).join(' ');
             return words;
@@ -211,31 +233,41 @@ jobs:
             const candidates = [
               prompt,
               shortenQuery(prompt),
-              'Hindu mythology painting',
+              'Ramayana painting',
+              'Hindu deity sculpture',
             ];
             for (const query of candidates) {
               if (!query) continue;
-              let pages = [];
+              let objectIDs = [];
               try {
-                pages = await searchCommons(query);
+                objectIDs = await searchMet(query);
               } catch (err) {
-                console.log(`Commons search failed for "${query.slice(0, 60)}": ${err.message}`);
+                console.log(`Met search failed for "${query.slice(0, 60)}": ${err.message}`);
                 continue;
               }
-              const usable = pages
-                .map((p) => p.imageinfo && p.imageinfo[0])
-                .filter((info) => info && (info.mime === 'image/jpeg' || info.mime === 'image/png'))
-                .map((info) => info.thumburl || info.url);
+              if (objectIDs.length === 0) continue;
+              // Only check a handful of candidates per query — enough to
+              // find a usable public-domain image without fetching every
+              // match's full detail record.
+              const details = await mapWithConcurrency(objectIDs.slice(0, 6), 3, async (id) => {
+                try {
+                  return await getMetObject(id);
+                } catch (err) {
+                  return null;
+                }
+              });
+              const usable = details
+                .filter((d) => d && d.isPublicDomain && (d.primaryImageSmall || d.primaryImage))
+                .map((d) => d.primaryImageSmall || d.primaryImage);
               if (usable.length > 0) {
-                console.log(`Scene ${i}: matched "${query.slice(0, 60)}" (${usable.length} results)`);
+                console.log(`Scene ${i}: matched "${query.slice(0, 60)}" (${usable.length} usable)`);
                 return usable[i % usable.length];
               }
             }
-            throw new Error(`No Commons results for scene ${i}`);
+            throw new Error(`No Met Museum results for scene ${i}`);
           }
 
-          // Used only for the search phase, which has held up fine under
-          // modest concurrency. Keep it low and staggered anyway to be a
+          // Keep concurrency modest and stagger requests slightly to be a
           // good citizen of a free, keyless API.
           async function mapWithConcurrency(items, limit, fn) {
             const results = new Array(items.length);
@@ -255,19 +287,18 @@ jobs:
 
           (async () => {
             // Phase 1: resolve a source image URL per scene by searching
-            // Commons. This hits the search API (commons.wikimedia.org),
-            // which has held up fine under modest concurrency.
+            // the Met Museum's collection (collectionapi.metmuseum.org).
             const imageUrls = await mapWithConcurrency(prompts, 3, (promptRaw, i) =>
               findImageUrl(promptRaw, i)
             );
 
             // Phase 2: download the actual image bytes serially, with a
             // fixed gap between requests on top of per-request retry/
-            // backoff. This hits upload.wikimedia.org (the CDN), which
-            // is far more sensitive to bursts from a shared IP.
+            // backoff, to stay a good citizen of the image CDN
+            // (images.metmuseum.org).
             const relPaths = new Array(prompts.length);
             for (let i = 0; i < imageUrls.length; i++) {
-              if (i > 0) await sleep(2000);
+              if (i > 0) await sleep(1000);
               const rel = `images/scene-${i}.jpg`;
               await downloadToFile(imageUrls[i], path.join('public', rel));
               relPaths[i] = rel;
