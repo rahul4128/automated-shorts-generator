@@ -124,7 +124,7 @@ jobs:
           node <<'EOF'
           const fs = require('fs');
           const path = require('path');
-          const https = require('https');
+          const { InferenceClient } = require('@huggingface/inference');
 
           let prompts = [];
           try {
@@ -137,15 +137,7 @@ jobs:
           }
 
           const HF_TOKEN = process.env.HF_TOKEN;
-          // stable-diffusion-2 is Hugging Face's own documented default for
-          // this task on their first-party "hf-inference" backend (the
-          // route used below). Newer/faster models like FLUX.1-schnell are
-          // often only hosted through third-party providers (fal-ai,
-          // replicate, etc.) with a different request shape, so they're
-          // not a drop-in override here without also changing the URL —
-          // stick with this default unless you've confirmed another
-          // model's provider and request format.
-          const HF_MODEL = process.env.HF_IMAGE_MODEL || 'stabilityai/stable-diffusion-2';
+          const HF_MODEL = process.env.HF_IMAGE_MODEL || 'black-forest-labs/FLUX.1-schnell';
 
           if (!HF_TOKEN) {
             console.error(
@@ -160,6 +152,35 @@ jobs:
             return new Promise((resolve) => setTimeout(resolve, ms));
           }
 
+          // Which third-party backend (fal-ai, replicate, nscale, ...)
+          // actually serves a given model changes over time, and picking
+          // wrong fails outright ("Model not supported by provider ...").
+          // Rather than hardcoding one, ask the Hub directly which
+          // providers currently list this model "live" for text-to-image,
+          // and use the @huggingface/inference SDK (below) so each
+          // provider's own request/response shape is handled for us
+          // instead of us guessing it.
+          async function pickLiveProvider(modelId) {
+            const res = await fetch(
+              `https://huggingface.co/api/models/${modelId}?expand[]=inferenceProviderMapping`,
+              { headers: { Authorization: `Bearer ${HF_TOKEN}` } }
+            );
+            if (!res.ok) {
+              throw new Error(`Failed to fetch provider mapping for ${modelId}: HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            const mapping = data.inferenceProviderMapping || {};
+            const live = Object.entries(mapping)
+              .filter(([, info]) => info.status === 'live' && info.task === 'text-to-image')
+              .map(([provider]) => provider);
+            if (live.length === 0) {
+              throw new Error(`No live text-to-image provider found for model ${modelId}`);
+            }
+            return live[0];
+          }
+
+          const client = new InferenceClient(HF_TOKEN);
+
           // Unlike a keyless search API over an existing image collection
           // (Wikimedia, the Met), this actually generates a new image from
           // the prompt — so scenes match the script instead of being the
@@ -168,79 +189,38 @@ jobs:
           // so it isn't subject to GitHub Actions' shared-IP rate limits
           // the way anonymous services were.
           //
-          // A cold model returns 503 with an `estimated_time` (seconds)
-          // hint in the JSON body — honor that instead of guessing a
+          // A cold model returns a 503 with an `estimated_time` (seconds)
+          // hint in the response body — honor that instead of guessing a
           // backoff. Real quota/error responses (401 bad token, 402 out of
           // credits, etc.) are not retried.
-          function generateImage(prompt, attempt = 1, maxAttempts = 6) {
-            return new Promise((resolve, reject) => {
-              const body = JSON.stringify({
+          async function generateImage(provider, prompt, attempt = 1, maxAttempts = 6) {
+            try {
+              const blob = await client.textToImage({
+                provider,
+                model: HF_MODEL,
                 inputs: prompt || 'devotional cinematic scene, warm lighting',
               });
-              const req = https.request(
-                `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`,
-                {
-                  method: 'POST',
-                  headers: {
-                    Authorization: `Bearer ${HF_TOKEN}`,
-                    'Content-Type': 'application/json',
-                    'Content-Length': Buffer.byteLength(body),
-                  },
-                },
-                (res) => {
-                  const chunks = [];
-                  res.on('data', (c) => chunks.push(c));
-                  res.on('end', () => {
-                    const buf = Buffer.concat(chunks);
-                    const contentType = res.headers['content-type'] || '';
-                    if (res.statusCode === 200 && contentType.startsWith('image/')) {
-                      return resolve(buf);
-                    }
-
-                    let hintSeconds = null;
-                    let errMessage = `HTTP ${res.statusCode}`;
-                    try {
-                      const parsed = JSON.parse(buf.toString('utf8'));
-                      if (parsed && typeof parsed.estimated_time === 'number') {
-                        hintSeconds = parsed.estimated_time;
-                      }
-                      if (parsed && parsed.error) errMessage = parsed.error;
-                    } catch (e) {
-                      // Non-JSON error body — keep the generic HTTP status message.
-                    }
-
-                    const isRetryable =
-                      res.statusCode === 429 || res.statusCode === 503 || res.statusCode >= 500;
-                    if (attempt < maxAttempts && isRetryable) {
-                      const backoffMs = hintSeconds
-                        ? Math.ceil(hintSeconds * 1000) + 1000
-                        : Math.min(30000, 3000 * 2 ** (attempt - 1));
-                      console.log(
-                        `HF generate -> ${errMessage}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
-                      );
-                      return sleep(backoffMs).then(() =>
-                        resolve(generateImage(prompt, attempt + 1, maxAttempts))
-                      );
-                    }
-                    return reject(new Error(`HF generate failed: ${errMessage}`));
-                  });
-                }
-              );
-              req.on('error', (err) => {
-                if (attempt < maxAttempts) {
-                  const backoffMs = Math.min(30000, 3000 * 2 ** (attempt - 1));
-                  return sleep(backoffMs).then(() =>
-                    resolve(generateImage(prompt, attempt + 1, maxAttempts))
-                  );
-                }
-                reject(err);
-              });
-              req.setTimeout(120000, () => {
-                req.destroy(new Error('timeout'));
-              });
-              req.write(body);
-              req.end();
-            });
+              return Buffer.from(await blob.arrayBuffer());
+            } catch (err) {
+              const status = err && err.httpResponse && err.httpResponse.status;
+              const body = err && err.httpResponse && err.httpResponse.body;
+              const isRetryable = status === 429 || status === 503 || (typeof status === 'number' && status >= 500);
+              if (attempt < maxAttempts && isRetryable) {
+                const hintSeconds =
+                  body && typeof body === 'object' && typeof body.estimated_time === 'number'
+                    ? body.estimated_time
+                    : null;
+                const backoffMs = hintSeconds
+                  ? Math.ceil(hintSeconds * 1000) + 1000
+                  : Math.min(30000, 3000 * 2 ** (attempt - 1));
+                console.log(
+                  `HF generate -> ${err.message}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
+                );
+                await sleep(backoffMs);
+                return generateImage(provider, prompt, attempt + 1, maxAttempts);
+              }
+              throw new Error(`HF generate failed: ${err.message}`);
+            }
           }
 
           // A couple of concurrent generations at a time — this is billed,
@@ -263,9 +243,12 @@ jobs:
           }
 
           (async () => {
+            const provider = await pickLiveProvider(HF_MODEL);
+            console.log(`Using provider "${provider}" for model ${HF_MODEL}`);
+
             const relPaths = new Array(prompts.length);
             await mapWithConcurrency(prompts, 2, async (promptRaw, i) => {
-              const buf = await generateImage(promptRaw);
+              const buf = await generateImage(provider, promptRaw);
               const rel = `images/scene-${i}.jpg`;
               fs.writeFileSync(path.join('public', rel), buf);
               relPaths[i] = rel;
