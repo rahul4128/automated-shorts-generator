@@ -14,9 +14,9 @@ on:
         required: false
         default: "श्री राम की महिमा अपरंपार है। हनुमान जी की भक्ति और सेवा सबसे बड़ी शक्ति है।"
       imagePrompts:
-        description: "JSON array of per-scene image search prompts"
+        description: "JSON array of per-scene image generation prompts"
         required: false
-        default: '["Rama and Sita painting", "Hanuman devotion painting", "Ramayana temple scene"]'
+        default: '["Rama and Sita in a forest, cinematic warm lighting, vertical", "Hanuman kneeling in devotion, golden hour, vertical", "Ramayana temple scene, devotional, vertical"]'
       title:
         description: "Video title"
         required: false
@@ -45,6 +45,11 @@ jobs:
       IMAGE_PROMPTS_JSON: ${{ (github.event.client_payload.imagePrompts && toJSON(github.event.client_payload.imagePrompts)) || github.event.inputs.imagePrompts }}
       VIDEO_TITLE: ${{ github.event.client_payload.title || github.event.inputs.title || 'Automated Video' }}
       VIDEO_DESCRIPTION: ${{ github.event.client_payload.description || github.event.inputs.description || '' }}
+      # Hugging Face access token with "Make calls to Inference Providers"
+      # permission — create one at huggingface.co/settings/tokens and add
+      # it as a repo secret named HF_TOKEN (Settings -> Secrets and
+      # variables -> Actions -> New repository secret).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -113,7 +118,7 @@ jobs:
           wait $NPM_PID
           wait $PIP_PID
         timeout-minutes: 6
-      - name: Download scene images
+      - name: Generate scene images
         run: |
           mkdir -p public/images out
           node <<'EOF'
@@ -131,149 +136,121 @@ jobs:
             prompts = [''];
           }
 
+          const HF_TOKEN = process.env.HF_TOKEN;
+          // stable-diffusion-2 is Hugging Face's own documented default for
+          // this task on their first-party "hf-inference" backend (the
+          // route used below). Newer/faster models like FLUX.1-schnell are
+          // often only hosted through third-party providers (fal-ai,
+          // replicate, etc.) with a different request shape, so they're
+          // not a drop-in override here without also changing the URL —
+          // stick with this default unless you've confirmed another
+          // model's provider and request format.
+          const HF_MODEL = process.env.HF_IMAGE_MODEL || 'stabilityai/stable-diffusion-2';
+
+          if (!HF_TOKEN) {
+            console.error(
+              'HF_TOKEN is not set. Create a token at huggingface.co/settings/tokens ' +
+                '(with "Make calls to Inference Providers" permission) and add it as a ' +
+                'repo secret named HF_TOKEN.'
+            );
+            process.exit(1);
+          }
+
           function sleep(ms) {
             return new Promise((resolve) => setTimeout(resolve, ms));
           }
 
-          // Generic HTTPS GET with retry/backoff on 429/5xx (honoring
-          // Retry-After when present) and a per-request timeout so a hung
-          // connection doesn't block forever.
-          function get(url, opts = {}) {
-            const {
-              attempt = 1,
-              maxAttempts = 6,
-              baseBackoffMs = 2000,
-              capBackoffMs = 30000,
-            } = opts;
+          // Unlike a keyless search API over an existing image collection
+          // (Wikimedia, the Met), this actually generates a new image from
+          // the prompt — so scenes match the script instead of being the
+          // closest pre-existing photo/artwork we could find. Billed
+          // per-account against Hugging Face's Inference Providers credit,
+          // so it isn't subject to GitHub Actions' shared-IP rate limits
+          // the way anonymous services were.
+          //
+          // A cold model returns 503 with an `estimated_time` (seconds)
+          // hint in the JSON body — honor that instead of guessing a
+          // backoff. Real quota/error responses (401 bad token, 402 out of
+          // credits, etc.) are not retried.
+          function generateImage(prompt, attempt = 1, maxAttempts = 6) {
             return new Promise((resolve, reject) => {
-              const req = https
-                .get(url, { headers: { 'User-Agent': 'automated-shorts-generator/1.0 (GitHub Actions render workflow)' } }, (res) => {
-                  const isRetryableStatus =
-                    res.statusCode === 429 || res.statusCode >= 500;
-                  if (res.statusCode !== 200) {
-                    res.resume();
-                    if (attempt < maxAttempts && (isRetryableStatus || attempt < 3)) {
-                      const retryAfterSec = parseInt(res.headers['retry-after'] || '', 10);
-                      const backoffMs = Number.isFinite(retryAfterSec)
-                        ? retryAfterSec * 1000
-                        : Math.min(capBackoffMs, baseBackoffMs * 2 ** (attempt - 1));
-                      console.log(
-                        `${url.split('?')[0]} -> ${res.statusCode}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
-                      );
-                      return sleep(backoffMs).then(() =>
-                        resolve(get(url, { ...opts, attempt: attempt + 1 }))
-                      );
-                    }
-                    return reject(new Error(`Failed ${url}: ${res.statusCode}`));
-                  }
+              const body = JSON.stringify({
+                inputs: prompt || 'devotional cinematic scene, warm lighting',
+              });
+              const req = https.request(
+                `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`,
+                {
+                  method: 'POST',
+                  headers: {
+                    Authorization: `Bearer ${HF_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body),
+                  },
+                },
+                (res) => {
                   const chunks = [];
                   res.on('data', (c) => chunks.push(c));
-                  res.on('end', () => resolve(Buffer.concat(chunks)));
-                })
-                .on('error', (err) => {
-                  if (attempt < maxAttempts) {
-                    const backoffMs = Math.min(capBackoffMs, baseBackoffMs * 2 ** (attempt - 1));
-                    return sleep(backoffMs).then(() =>
-                      resolve(get(url, { ...opts, attempt: attempt + 1 }))
-                    );
-                  }
-                  reject(err);
-                });
-              req.setTimeout(60000, () => {
+                  res.on('end', () => {
+                    const buf = Buffer.concat(chunks);
+                    const contentType = res.headers['content-type'] || '';
+                    if (res.statusCode === 200 && contentType.startsWith('image/')) {
+                      return resolve(buf);
+                    }
+
+                    let hintSeconds = null;
+                    let errMessage = `HTTP ${res.statusCode}`;
+                    try {
+                      const parsed = JSON.parse(buf.toString('utf8'));
+                      if (parsed && typeof parsed.estimated_time === 'number') {
+                        hintSeconds = parsed.estimated_time;
+                      }
+                      if (parsed && parsed.error) errMessage = parsed.error;
+                    } catch (e) {
+                      // Non-JSON error body — keep the generic HTTP status message.
+                    }
+
+                    const isRetryable =
+                      res.statusCode === 429 || res.statusCode === 503 || res.statusCode >= 500;
+                    if (attempt < maxAttempts && isRetryable) {
+                      const backoffMs = hintSeconds
+                        ? Math.ceil(hintSeconds * 1000) + 1000
+                        : Math.min(30000, 3000 * 2 ** (attempt - 1));
+                      console.log(
+                        `HF generate -> ${errMessage}, retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`
+                      );
+                      return sleep(backoffMs).then(() =>
+                        resolve(generateImage(prompt, attempt + 1, maxAttempts))
+                      );
+                    }
+                    return reject(new Error(`HF generate failed: ${errMessage}`));
+                  });
+                }
+              );
+              req.on('error', (err) => {
+                if (attempt < maxAttempts) {
+                  const backoffMs = Math.min(30000, 3000 * 2 ** (attempt - 1));
+                  return sleep(backoffMs).then(() =>
+                    resolve(generateImage(prompt, attempt + 1, maxAttempts))
+                  );
+                }
+                reject(err);
+              });
+              req.setTimeout(120000, () => {
                 req.destroy(new Error('timeout'));
               });
+              req.write(body);
+              req.end();
             });
           }
 
-          async function downloadToFile(url, dest) {
-            const buf = await get(url, {
-              maxAttempts: 6,
-              baseBackoffMs: 2000,
-              capBackoffMs: 15000,
-            });
-            fs.writeFileSync(dest, buf);
-          }
-
-          // Wikimedia has been publicly fighting a surge in automated/AI
-          // crawler traffic since 2025 and has responded by throttling
-          // datacenter/bot-like traffic much harder — which is why both
-          // its search API and its image CDN kept 429ing GitHub Actions'
-          // shared runner IPs no matter how much we slowed down. The Met
-          // Museum's Open Access API is a better fit for CI: it's free,
-          // keyless, explicitly built and scaled for open bulk/
-          // programmatic reuse (no crawler crackdown to get caught in),
-          // and its Asian Art department holds a large collection of
-          // Ramayana and Hindu devotional paintings/sculpture.
-          async function searchMet(query) {
-            const url = `https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${encodeURIComponent(query)}`;
-            const buf = await get(url);
-            const data = JSON.parse(buf.toString('utf8'));
-            return Array.isArray(data.objectIDs) ? data.objectIDs : [];
-          }
-
-          async function getMetObject(id) {
-            const url = `https://collectionapi.metmuseum.org/public/collection/v1/objects/${id}`;
-            const buf = await get(url);
-            return JSON.parse(buf.toString('utf8'));
-          }
-
-          function shortenQuery(query) {
-            // The Met's search works best on a handful of keywords rather
-            // than a long, comma-separated cinematic prompt. Fall back to
-            // progressively shorter/simpler queries if a full prompt
-            // returns no matches.
-            const firstClause = query.split(',')[0];
-            const words = firstClause.trim().split(/\s+/).slice(0, 6).join(' ');
-            return words;
-          }
-
-          async function findImageUrl(promptRaw, i) {
-            const prompt =
-              promptRaw || 'devotional cinematic scene, warm lighting';
-            const candidates = [
-              prompt,
-              shortenQuery(prompt),
-              'Ramayana painting',
-              'Hindu deity sculpture',
-            ];
-            for (const query of candidates) {
-              if (!query) continue;
-              let objectIDs = [];
-              try {
-                objectIDs = await searchMet(query);
-              } catch (err) {
-                console.log(`Met search failed for "${query.slice(0, 60)}": ${err.message}`);
-                continue;
-              }
-              if (objectIDs.length === 0) continue;
-              // Only check a handful of candidates per query — enough to
-              // find a usable public-domain image without fetching every
-              // match's full detail record.
-              const details = await mapWithConcurrency(objectIDs.slice(0, 6), 3, async (id) => {
-                try {
-                  return await getMetObject(id);
-                } catch (err) {
-                  return null;
-                }
-              });
-              const usable = details
-                .filter((d) => d && d.isPublicDomain && (d.primaryImageSmall || d.primaryImage))
-                .map((d) => d.primaryImageSmall || d.primaryImage);
-              if (usable.length > 0) {
-                console.log(`Scene ${i}: matched "${query.slice(0, 60)}" (${usable.length} usable)`);
-                return usable[i % usable.length];
-              }
-            }
-            throw new Error(`No Met Museum results for scene ${i}`);
-          }
-
-          // Keep concurrency modest and stagger requests slightly to be a
-          // good citizen of a free, keyless API.
+          // A couple of concurrent generations at a time — this is billed,
+          // compute-heavy work per request, not a free bulk API, so there's
+          // no need (or benefit) to hammer it with high concurrency.
           async function mapWithConcurrency(items, limit, fn) {
             const results = new Array(items.length);
             let next = 0;
             async function worker(workerIndex) {
-              await sleep(workerIndex * 1000);
+              await sleep(workerIndex * 500);
               while (next < items.length) {
                 const i = next++;
                 results[i] = await fn(items[i], i);
@@ -286,25 +263,14 @@ jobs:
           }
 
           (async () => {
-            // Phase 1: resolve a source image URL per scene by searching
-            // the Met Museum's collection (collectionapi.metmuseum.org).
-            const imageUrls = await mapWithConcurrency(prompts, 3, (promptRaw, i) =>
-              findImageUrl(promptRaw, i)
-            );
-
-            // Phase 2: download the actual image bytes serially, with a
-            // fixed gap between requests on top of per-request retry/
-            // backoff, to stay a good citizen of the image CDN
-            // (images.metmuseum.org).
             const relPaths = new Array(prompts.length);
-            for (let i = 0; i < imageUrls.length; i++) {
-              if (i > 0) await sleep(1000);
+            await mapWithConcurrency(prompts, 2, async (promptRaw, i) => {
+              const buf = await generateImage(promptRaw);
               const rel = `images/scene-${i}.jpg`;
-              await downloadToFile(imageUrls[i], path.join('public', rel));
+              fs.writeFileSync(path.join('public', rel), buf);
               relPaths[i] = rel;
-              console.log(`Downloaded scene ${i}: ${(prompts[i] || '').slice(0, 60)}`);
-            }
-
+              console.log(`Generated scene ${i}: ${(promptRaw || '').slice(0, 60)}`);
+            });
             fs.writeFileSync('out/images.json', JSON.stringify(relPaths));
             fs.copyFileSync(path.join('public', relPaths[0]), 'out/thumbnail.jpg');
           })().catch((err) => {
